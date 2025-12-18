@@ -1,5 +1,5 @@
 from lmdeploy import pipeline, TurbomindEngineConfig, GenerationConfig
-from decoder import Decoder
+from .vocos.decoder import SopranoDecoder
 import torch
 import re
 from unidecode import unidecode
@@ -8,15 +8,17 @@ from huggingface_hub import hf_hub_download
 import os
 
 
-class TTS:
+class SopranoTTS:
     def __init__(self,
-            cache_size=0.05,
+            cache_size_mb=100,
             decoder_batch_size=None):
-        backend_config = TurbomindEngineConfig(cache_max_entry_count=cache_size)
+        cache_size_ratio = cache_size_mb * 1024**2 / torch.cuda.get_device_properties('cuda').total_memory
+        print(cache_size_ratio)
+        backend_config = TurbomindEngineConfig(cache_max_entry_count=cache_size_ratio)
         self.pipeline = pipeline('ekwek/Soprano-80M', # get ckpt path
             log_level='ERROR',
             backend_config=backend_config)
-        self.decoder = Decoder().cuda()
+        self.decoder = SopranoDecoder().cuda()
         decoder_path = hf_hub_download(repo_id='ekwek/Soprano-80M', filename='decoder.pth')
         self.decoder.load_state_dict(torch.load(decoder_path)) # get ckpt path
         self.decoder_batch_size=decoder_batch_size
@@ -44,7 +46,7 @@ class TTS:
                 if old_len != new_len:
                     print(f"Warning: unsupported characters found in sentence: {sentence}\n\tThese characters have been removed.")
                 new_sentence = unidecode(new_sentence.strip())
-                processed_sentences.append((f'[STOP][HST]{new_sentence}[START]', text_idx, sentence_idx))
+                processed_sentences.append((f'[STOP][TEXT]{new_sentence}[START]', text_idx, sentence_idx))
             res.extend(processed_sentences)
         return res
 
