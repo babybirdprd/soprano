@@ -542,17 +542,7 @@ impl SopranoDecoder {
 
         let spectral = spectral.contiguous()?;
         let idft_t = self.idft_matrix.t()?.contiguous()?;
-        // spectral: (1, 797, 2050)
-        // idft_t: (2050, 2048)
-        // matmul broadcasting: lhs must be (..., 2050). rhs must be (2050, 2048).
-        // Result: (..., 2048).
-        // If broadcasting is issue, we might need to reshape.
-        // But lhs is (1, 797, 2050) which is valid 3D tensor.
-        // Error "shape mismatch" with those shapes is weird if dimensions match.
-        // It's possible matmul expects contiguous inputs on both sides (I fixed that).
-        // Or maybe it is treating batch dim differently?
-
-        // Let's try to reshape spectral to (B*T, 2F) then matmul then reshape back?
+        // Reshape spectral to (B*T, 2F) for matmul compatibility with idft_matrix (2F, n_fft)
         let (b, t, f2) = spectral.dims3()?;
         let spectral_flat = spectral.reshape((b * t, f2))?;
         let ifft_flat = spectral_flat.matmul(&idft_t)?;
