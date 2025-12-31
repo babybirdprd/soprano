@@ -12,7 +12,7 @@ pub struct Config {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub max_position_embeddings: usize,
-    pub sliding_window: usize,
+    pub sliding_window: Option<usize>,
     pub max_window_layers: Option<usize>,
     pub tie_word_embeddings: bool,
     pub rope_theta: f64,
@@ -163,9 +163,12 @@ impl Attention {
         let num_kv_heads = cfg.num_key_value_heads;
         let num_kv_groups = num_heads / num_kv_heads;
         let head_dim = hidden_sz / num_heads;
-        let q_proj = linear(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?;
+        let q_proj = linear(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))
+            .or_else(|_| linear_no_bias(hidden_sz, num_heads * head_dim, vb.pp("q_proj")))?;
+        let k_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))
+            .or_else(|_| linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj")))?;
+        let v_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))
+            .or_else(|_| linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj")))?;
         let o_proj = linear_no_bias(num_heads * head_dim, hidden_sz, vb.pp("o_proj"))?;
         Ok(Self {
             q_proj,
@@ -328,7 +331,7 @@ impl Model {
             embed_tokens,
             layers,
             norm,
-            sliding_window: cfg.sliding_window,
+            sliding_window: cfg.sliding_window.unwrap_or(4096),
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
