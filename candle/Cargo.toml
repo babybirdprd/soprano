@@ -7,7 +7,7 @@ edition = "2021"
 candle-core = { version = "0.8.0" }
 candle-nn = "0.8.0"
 candle-transformers = "0.8.0"
-tokenizers = "0.19.1"
+tokenizers = "0.22.1"
 anyhow = "1.0"
 hound = "3.5"
 serde = { version = "1.0", features = ["derive"] }

@@ -507,7 +507,46 @@ impl SopranoDecoder {
         // idft_matrix: (n_fft, 2F)
         // output: spectral @ idft_matrix.t() -> (B, T, n_fft)
 
-        let ifft = spectral.matmul(&self.idft_matrix.t()?)?;
+        // spectral: (B, T, 2F)
+        // idft_matrix: (n_fft, 2F)
+        // We want (B, T, n_fft)
+        // spectral * idft_matrix^T is (B, T, 2F) * (2F, n_fft) -> (B, T, n_fft)
+        // Check shapes:
+        // spectral: (1, 797, 2050) - 2F = 2050 -> F = 1025.
+        // n_fft = 2048. n_fft / 2 + 1 = 1025. 2F = 2050. Correct.
+        // idft_matrix: (2050, 2048) - Wait, idft_matrix logic returns (n_fft, input_dim) transposed to (input_dim, n_fft) ?
+        // In make_idft_matrix:
+        // input_dim = 2 * num_freqs = 2050.
+        // Tensor::from_vec(matrix, (input_dim, n_fft))
+        // Returns tensor.t() -> (n_fft, input_dim) -> (2048, 2050).
+        // So idft_matrix is (2048, 2050).
+        // self.idft_matrix.t() is (2050, 2048).
+        // matmul lhs: (1, T, 2050), rhs: (2050, 2048).
+        // The error said: lhs: [1, 797, 2050], rhs: [2050, 2048].
+        // This shape matches for matmul. Why shape mismatch error?
+        // Ah, Candle matmul checks: (..., M, K) x (K, N) -> (..., M, N).
+        // Here M=797, K=2050. RHS is K=2050, N=2048.
+        // Error message: shape mismatch in matmul, lhs: [1, 797, 2050], rhs: [2050, 2048]
+        // Usually mismatch means inner dimensions don't match. 2050 == 2050.
+        // Maybe broadcast issue?
+        // If RHS is 2D, it should broadcast.
+        // Let's try explicit broadcast or just using linear.
+
+        // Actually, looking at error again: "shape mismatch in matmul, lhs: [1, 797, 2050], rhs: [2050, 2048]"
+        // It lists the shapes. If it's a mismatch error, it usually says "dim 2 of lhs != dim 0 of rhs".
+        // If it just prints shapes, maybe they ARE mismatched in a way I don't see?
+        // Wait, 2050 and 2050 match.
+        // Maybe the error comes from deeper?
+        // Or maybe `spectral` is not contiguous?
+        // Let's make spectral contiguous.
+
+        let spectral = spectral.contiguous()?;
+        let idft_t = self.idft_matrix.t()?.contiguous()?;
+        // Reshape spectral to (B*T, 2F) for matmul compatibility with idft_matrix (2F, n_fft)
+        let (b, t, f2) = spectral.dims3()?;
+        let spectral_flat = spectral.reshape((b * t, f2))?;
+        let ifft_flat = spectral_flat.matmul(&idft_t)?;
+        let ifft = ifft_flat.reshape((b, t, ifft_flat.dim(1)?))?;
 
         // Apply window
         // window: (n_fft)
@@ -615,6 +654,8 @@ fn interpolate_linear(x: &Tensor, scale_factor: usize) -> Result<Tensor> {
     let alpha = Tensor::from_vec(alphas, (1, 1, new_t), device)?;
 
     // Gather on dim 2
+    // Ensure contiguous before index_select for safety, although x should be contiguous from caller
+    let x = x.contiguous()?;
     let x_floor = x.index_select(&idx_floor, 2)?;
     let x_ceil = x.index_select(&idx_ceil, 2)?;
 
