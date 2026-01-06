@@ -1,4 +1,4 @@
-use candle_core::{Device, Result, Tensor, DType};
+use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, LayerNorm, Linear, Module, VarBuilder};
 use serde::Deserialize;
 
@@ -48,19 +48,19 @@ impl ConvNeXtBlock {
                 // However, the logic in python checks init_value > 0 to decide whether to create it.
                 // We should check if "gamma" exists in vb.
                 if vb.contains_tensor("gamma") {
-                     Some(vb.get(dim, "gamma")?)
+                    Some(vb.get(dim, "gamma")?)
                 } else {
-                     None
+                    None
                 }
             } else {
                 None
             }
         } else {
             // If layer_scale_init_value is None, check if gamma exists anyway (maybe passed differently or default behaviour)
-             if vb.contains_tensor("gamma") {
-                 Some(vb.get(dim, "gamma")?)
+            if vb.contains_tensor("gamma") {
+                Some(vb.get(dim, "gamma")?)
             } else {
-                 None
+                None
             }
         };
 
@@ -86,11 +86,11 @@ impl Module for ConvNeXtBlock {
         let x = self.pwconv2.forward(&x)?;
 
         let x = if let Some(gamma) = &self.gamma {
-             // gamma is (C), x is (B, T, C)
-             // broadcasting happens on last dim automatically?
-             // Candle broadcasting: if shapes match from right.
-             // gamma: (C), x: (B, T, C). Yes.
-             x.broadcast_mul(gamma)?
+            // gamma is (C), x is (B, T, C)
+            // broadcasting happens on last dim automatically?
+            // Candle broadcasting: if shapes match from right.
+            // gamma: (C), x: (B, T, C). Yes.
+            x.broadcast_mul(gamma)?
         } else {
             x
         };
@@ -126,7 +126,13 @@ impl VocosBackbone {
             padding: input_kernel_size / 2,
             ..Default::default()
         };
-        let embed = candle_nn::conv1d(input_channels, dim, input_kernel_size, embed_cfg, vb.pp("embed"))?;
+        let embed = candle_nn::conv1d(
+            input_channels,
+            dim,
+            input_kernel_size,
+            embed_cfg,
+            vb.pp("embed"),
+        )?;
         let norm = candle_nn::layer_norm(dim, 1e-6, vb.pp("norm"))?;
 
         let mut convnext = Vec::new();
@@ -186,7 +192,7 @@ impl ISTFTHead {
         let n_fft = cfg.n_fft;
         let hop_length = cfg.hop_length;
         let win_length = n_fft; // In Python code: win_length=n_fft
-        let padding = "same".to_string();
+        let padding = "center".to_string(); // Python default is "center"
 
         let out_dim = n_fft + 2;
         let out = candle_nn::linear(dim, out_dim, vb.pp("out"))?;
@@ -349,10 +355,10 @@ fn hann_window(size: usize, device: &Device) -> Result<Tensor> {
         let n = i as f64;
         let m = size as f64;
         let val = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * n / m).cos()); // Standard Hann window
-        // Note: PyTorch hann_window might be periodic=True by default which uses M instead of M-1?
-        // torch.hann_window(window_length, periodic=True, *)
-        // If periodic=True (default), formula uses N. If periodic=False, uses N-1.
-        // STFT usually uses periodic window.
+                                                                            // Note: PyTorch hann_window might be periodic=True by default which uses M instead of M-1?
+                                                                            // torch.hann_window(window_length, periodic=True, *)
+                                                                            // If periodic=True (default), formula uses N. If periodic=False, uses N-1.
+                                                                            // STFT usually uses periodic window.
         data.push(val as f32);
     }
     Tensor::from_vec(data, (size,), device)
@@ -395,7 +401,11 @@ fn make_idft_matrix(n_fft: usize, device: &Device) -> Result<Tensor> {
             let re_idx = k;
             let im_idx = k + num_freqs;
 
-            let factor = if k == 0 || k == num_freqs - 1 { 1.0 } else { 2.0 };
+            let factor = if k == 0 || k == num_freqs - 1 {
+                1.0
+            } else {
+                2.0
+            };
             // Wait, nyquist index is n_fft/2. num_freqs = n_fft/2 + 1. So last index is n_fft/2.
 
             // For Re[k]
@@ -403,9 +413,9 @@ fn make_idft_matrix(n_fft: usize, device: &Device) -> Result<Tensor> {
 
             // For Im[k]
             if k > 0 && k < num_freqs - 1 {
-                 matrix[im_idx * n_fft + n] = -scale * factor * sin_v;
+                matrix[im_idx * n_fft + n] = -scale * factor * sin_v;
             } else {
-                 matrix[im_idx * n_fft + n] = 0.0;
+                matrix[im_idx * n_fft + n] = 0.0;
             }
         }
     }
@@ -420,7 +430,7 @@ fn make_idft_matrix(n_fft: usize, device: &Device) -> Result<Tensor> {
     // Let's create tensor (in_dim, out_dim) and transpose.
 
     let tensor = Tensor::from_vec(matrix, (input_dim, n_fft), device)?;
-    Ok(tensor.t()?) // (n_fft, input_dim)
+    Ok(tensor) // (input_dim, n_fft)
 }
 
 pub struct SopranoDecoder {
@@ -450,30 +460,6 @@ impl SopranoDecoder {
         let (b, c, t) = x.dims3()?;
 
         // Interpolate
-        // x = torch.nn.functional.interpolate(x, size=self.upscale*(T-1)+1, mode='linear', align_corners=True)
-        // Candle doesn't have interpolate.
-        // We can do nearest neighbor or implement linear interpolation.
-        // Linear interpolation for 1D:
-        // Output size: new_t = upscale * (t - 1) + 1
-        // We can use conv1d transpose maybe? Or just write a kernel.
-        // Or simple loop/gather since we need it.
-        // Since it's 1D linear interpolation, it's efficient to do with index manipulation.
-        // But for "candle" we want to use tensor ops.
-        // We can use `upsample_nearest1d` if available, but we need linear.
-        // We can use Conv1dTranspose to do linear interpolation?
-        // A Conv1dTranspose with stride=upscale and appropriate weights is equivalent to linear interpolation?
-        // Linear interpolation corresponds to a triangular kernel.
-
-        // Kernel for linear interp (upscale=4):
-        // [0.25, 0.5, 0.75, 1.0, 0.75, 0.5, 0.25] ? No.
-        // It's [1-3/4, 1-2/4, 1-1/4, 1, ...]
-
-        // Let's implement it manually using index_select or gather?
-        // Or since `upscale` is small (4), we can interleave zeros and do average pooling? No, conv.
-        // "Align corners = True" is tricky with conv.
-
-        // Let's leave interpolation for a helper function.
-
         let x_interp = interpolate_linear(x, self.upscale)?;
 
         let x_decoded = self.decoder.forward(&x_interp)?;
@@ -494,20 +480,39 @@ impl SopranoDecoder {
         let re = (mag.clone() * cos_p)?;
         let im = (mag * sin_p)?;
 
+        // Get dimensions first, before any conditional processing
+        let (b, f, t_out) = re.dims3()?;
+
+        // For "center" padding, zero DC (bin 0) and Nyquist (last bin)
+        // Python: spec[:,0] = 0; spec[:,-1] = 0
+        let (re, im) = if self.head.padding == "center" && f > 2 {
+            let re_inner = re.narrow(1, 1, f - 2)?; // Skip first, skip last
+            let im_inner = im.narrow(1, 1, f - 2)?;
+            let zeros_shape = (b, 1, t_out);
+            let zeros = Tensor::zeros(zeros_shape, re_inner.dtype(), re_inner.device())?;
+            let re_new = Tensor::cat(&[&zeros, &re_inner, &zeros], 1)?; // Add back DC and Nyquist as zeros
+            let im_new = Tensor::cat(&[&zeros, &im_inner, &zeros], 1)?;
+            (re_new, im_new)
+        } else {
+            (re, im)
+        };
+
         // ISTFT
         // re, im: (B, F, T)
-        let (b, f, t_out) = re.dims3()?;
+        let (_, f, t_out) = re.dims3()?;
         let re_t = re.transpose(1, 2)?; // (B, T, F)
         let im_t = im.transpose(1, 2)?;
 
-        let spectral = Tensor::cat(&[&re_t, &im_t], 2)?; // (B, T, 2F)
+        let spectral = Tensor::cat(&[&re_t, &im_t], 2)?.contiguous()?; // (B, T, 2F)
 
         // Apply IDFT matrix
         // spectral: (B, T, 2F)
-        // idft_matrix: (n_fft, 2F)
-        // output: spectral @ idft_matrix.t() -> (B, T, n_fft)
-
-        let ifft = spectral.matmul(&self.idft_matrix.t()?)?;
+        // idft_matrix: (2F, n_fft)
+        // output: spectral @ idft_matrix -> (B, T, n_fft)
+        let (b_idft, t_idft, f2_idft) = spectral.dims3()?;
+        let spectral_2d = spectral.reshape((b_idft * t_idft, f2_idft))?;
+        let ifft_2d = spectral_2d.matmul(&self.idft_matrix)?;
+        let ifft = ifft_2d.reshape((b_idft, t_idft, self.head.n_fft))?;
 
         // Apply window
         // window: (n_fft)
@@ -531,8 +536,14 @@ impl SopranoDecoder {
 
         // Calculate output size
         let output_size = (n_frames - 1) * hop_length + win_length;
-        // Padding "same": pad = (win_length - hop_length) // 2
-        let pad = (win_length - hop_length) / 2;
+
+        // For "center" padding (Python default), pad = n_fft // 2
+        // For "same" padding, pad = (win_length - hop_length) // 2
+        let pad = if self.head.padding == "center" {
+            self.head.n_fft / 2
+        } else {
+            (win_length - hop_length) / 2
+        };
 
         let mut output_audio = vec![0.0f32; output_size];
         let mut envelope = vec![0.0f32; output_size];
@@ -552,15 +563,20 @@ impl SopranoDecoder {
         }
 
         // Normalize and trim padding
-        let valid_len = output_size - 2 * pad;
-        let mut result = Vec::with_capacity(valid_len);
+        let end_idx = if output_size > pad {
+            output_size - pad
+        } else {
+            output_size
+        };
+        let start_idx = pad.min(end_idx);
+        let mut result = Vec::with_capacity(end_idx - start_idx);
 
-        for i in pad..(output_size - pad) {
-             if envelope[i] > 1e-11 {
-                 result.push(output_audio[i] / envelope[i]);
-             } else {
-                 result.push(output_audio[i]);
-             }
+        for i in start_idx..end_idx {
+            if envelope[i] > 1e-11 {
+                result.push(output_audio[i] / envelope[i]);
+            } else {
+                result.push(output_audio[i]);
+            }
         }
 
         Ok(result)
@@ -603,7 +619,12 @@ fn interpolate_linear(x: &Tensor, scale_factor: usize) -> Result<Tensor> {
         let p = i as f32 / scale_factor as f32;
         let p_floor = p.floor() as i64;
         let p_ceil = p.ceil() as i64;
-        let alpha = p - p_floor as f32;
+
+        // Clamp indices to [0, t-1]
+        let p_floor = p_floor.clamp(0, (t - 1) as i64);
+        let p_ceil = p_ceil.clamp(0, (t - 1) as i64);
+
+        let alpha = p - p.floor();
 
         indices_floor.push(p_floor);
         indices_ceil.push(p_ceil);

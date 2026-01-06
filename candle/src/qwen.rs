@@ -1,7 +1,7 @@
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{Activation, VarBuilder};
-use std::sync::Arc;
 use serde::Deserialize;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
@@ -12,13 +12,14 @@ pub struct Config {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub max_position_embeddings: usize,
-    pub sliding_window: usize,
+    pub sliding_window: Option<usize>,
     pub max_window_layers: Option<usize>,
     pub tie_word_embeddings: bool,
     pub rope_theta: f64,
     pub rms_norm_eps: f64,
     pub use_sliding_window: bool,
     pub hidden_act: Activation,
+    pub attention_bias: bool,
 }
 
 // Helpers from candle-transformers
@@ -65,7 +66,6 @@ impl Module for RmsNorm {
         self.forward(x)
     }
 }
-
 
 #[derive(Debug, Clone)]
 struct RotaryEmbedding {
@@ -147,6 +147,8 @@ struct Attention {
     k_proj: candle_nn::Linear,
     v_proj: candle_nn::Linear,
     o_proj: candle_nn::Linear,
+    q_norm: RmsNorm, // Qwen3: RMSNorm on Q after projection
+    k_norm: RmsNorm, // Qwen3: RMSNorm on K after projection
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
@@ -163,15 +165,38 @@ impl Attention {
         let num_kv_heads = cfg.num_key_value_heads;
         let num_kv_groups = num_heads / num_kv_heads;
         let head_dim = hidden_sz / num_heads;
-        let q_proj = linear(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?;
+
+        let q_proj = if cfg.attention_bias {
+            linear(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?
+        } else {
+            linear_no_bias(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?
+        };
+
+        let k_proj = if cfg.attention_bias {
+            linear(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?
+        } else {
+            linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?
+        };
+
+        let v_proj = if cfg.attention_bias {
+            linear(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?
+        } else {
+            linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?
+        };
+
         let o_proj = linear_no_bias(num_heads * head_dim, hidden_sz, vb.pp("o_proj"))?;
+
+        // Qwen3: RMSNorm on Q and K (applied per-head, so norm dim = head_dim)
+        let q_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
+        let k_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
+            q_norm,
+            k_norm,
             num_heads,
             num_kv_heads,
             num_kv_groups,
@@ -204,6 +229,10 @@ impl Attention {
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
+        // Qwen3: Apply Q/K normalization (per-head, on last dim = head_dim)
+        let query_states = self.q_norm.forward(&query_states)?;
+        let key_states = self.k_norm.forward(&key_states)?;
+
         let (query_states, key_states) =
             self.rotary_emb
                 .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
@@ -221,13 +250,19 @@ impl Attention {
         // repeat kv
         let key_states = if self.num_kv_groups > 1 {
             let (b, n_kv, l, d) = key_states.dims4()?;
-             key_states.unsqueeze(2)?.repeat((1, 1, self.num_kv_groups, 1, 1))?.reshape((b, n_kv * self.num_kv_groups, l, d))?
+            key_states
+                .unsqueeze(2)?
+                .repeat((1, 1, self.num_kv_groups, 1, 1))?
+                .reshape((b, n_kv * self.num_kv_groups, l, d))?
         } else {
             key_states
         };
         let value_states = if self.num_kv_groups > 1 {
-             let (b, n_kv, l, d) = value_states.dims4()?;
-             value_states.unsqueeze(2)?.repeat((1, 1, self.num_kv_groups, 1, 1))?.reshape((b, n_kv * self.num_kv_groups, l, d))?
+            let (b, n_kv, l, d) = value_states.dims4()?;
+            value_states
+                .unsqueeze(2)?
+                .repeat((1, 1, self.num_kv_groups, 1, 1))?
+                .reshape((b, n_kv * self.num_kv_groups, l, d))?
         } else {
             value_states
         };
@@ -328,7 +363,7 @@ impl Model {
             embed_tokens,
             layers,
             norm,
-            sliding_window: cfg.sliding_window,
+            sliding_window: cfg.sliding_window.unwrap_or(0),
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
@@ -342,15 +377,7 @@ impl Model {
     ) -> Result<Tensor> {
         // Simple causal mask
         let mask: Vec<_> = (0..tgt_len)
-            .flat_map(|i| {
-                (0..tgt_len).map(move |j| {
-                    if i < j {
-                        f32::NEG_INFINITY
-                    } else {
-                        0.
-                    }
-                })
-            })
+            .flat_map(|i| (0..tgt_len).map(move |j| if i < j { f32::NEG_INFINITY } else { 0. }))
             .collect();
         let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?;
         let mask = if seqlen_offset > 0 {
@@ -429,10 +456,13 @@ impl ModelForCausalLM {
     }
 
     // Modified forward to return both logits and hidden states
-    pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<(Tensor, Tensor)> {
+    pub fn forward(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
         let (_b_size, seq_len) = input_ids.dims2()?;
-        let hidden_states = self.base_model
-            .forward(input_ids, seqlen_offset, None)?;
+        let hidden_states = self.base_model.forward(input_ids, seqlen_offset, None)?;
 
         let logits = hidden_states
             .narrow(1, seq_len - 1, 1)?

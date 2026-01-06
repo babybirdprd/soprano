@@ -1,6 +1,6 @@
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{VarBuilder};
+use candle_nn::VarBuilder;
 // use candle_transformers::models::qwen2::{Config as QwenConfig, ModelForCausalLM as QwenModel};
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
@@ -15,7 +15,11 @@ use qwen::{Config as QwenConfig, ModelForCausalLM as QwenModel};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, default_value = "Hello world! This is a test of the Soprano text to speech model port to Rust using Candle.")]
+    #[arg(
+        short,
+        long,
+        default_value = "Hello world! This is a test of the Soprano text to speech model port to Rust using Candle."
+    )]
     prompt: String,
 
     #[arg(long, default_value = "output.wav")]
@@ -23,6 +27,18 @@ struct Args {
 
     #[arg(long)]
     cpu: bool,
+}
+
+fn clean_text(text: &str) -> String {
+    // Basic cleaning: lowercase and remove non-alphabetical/basic punctuation
+    let text = text.to_lowercase();
+    let mut cleaned = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() || " !$%&'*+,-./0123456789<>?_".contains(c) {
+            cleaned.push(c);
+        }
+    }
+    cleaned
 }
 
 fn main() -> Result<()> {
@@ -37,18 +53,32 @@ fn main() -> Result<()> {
 
     // 1. Load Tokenizer
     println!("Loading tokenizer...");
-    let api = Api::new()?;
-    let repo = api.repo(Repo::new("ekwek/Soprano-80M".to_string(), RepoType::Model));
-    let tokenizer_filename = repo.get("tokenizer.json")?;
-    let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
+    let tokenizer_path = if std::path::Path::new("tokenizer.json").exists() {
+        std::path::PathBuf::from("tokenizer.json")
+    } else {
+        let api = Api::new()?;
+        let repo = api.repo(Repo::new("ekwek/Soprano-80M".to_string(), RepoType::Model));
+        repo.get("tokenizer.json")?
+    };
+    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
 
     // 2. Load Qwen Model
     println!("Loading Qwen model...");
-    let config_filename = repo.get("config.json")?;
-    let config: QwenConfig = serde_json::from_str(&std::fs::read_to_string(config_filename)?)?;
+    let (config_path, model_path) = if std::path::Path::new("config.json").exists()
+        && std::path::Path::new("model.safetensors").exists()
+    {
+        (
+            std::path::PathBuf::from("config.json"),
+            std::path::PathBuf::from("model.safetensors"),
+        )
+    } else {
+        let api = Api::new()?;
+        let repo = api.repo(Repo::new("ekwek/Soprano-80M".to_string(), RepoType::Model));
+        (repo.get("config.json")?, repo.get("model.safetensors")?)
+    };
 
-    let model_filename = repo.get("model.safetensors")?;
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_filename], DType::F32, &device)? };
+    let config: QwenConfig = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_path], DType::F32, &device)? };
     let mut qwen = QwenModel::new(&config, vb)?;
 
     // 3. Load Vocos Model
@@ -59,59 +89,114 @@ fn main() -> Result<()> {
     // Cargo run usually runs from the package root.
 
     // Check if files exist, if not look in local `candle/` folder (if run from repo root)
-    let (vocos_config_path, vocos_weights_path) = if std::path::Path::new("vocos_config.json").exists() {
-        ("vocos_config.json", "decoder.safetensors")
-    } else if std::path::Path::new("candle/vocos_config.json").exists() {
-        ("candle/vocos_config.json", "candle/decoder.safetensors")
-    } else {
-        // Fallback: Use Phase 1 output directly if not found
-        anyhow::bail!("Could not find vocos_config.json. Did you run convert.py?");
-    };
+    let (vocos_config_path, vocos_weights_path) =
+        if std::path::Path::new("vocos_config.json").exists() {
+            ("vocos_config.json", "decoder.safetensors")
+        } else if std::path::Path::new("candle/vocos_config.json").exists() {
+            ("candle/vocos_config.json", "candle/decoder.safetensors")
+        } else {
+            // Fallback: Use Phase 1 output directly if not found
+            anyhow::bail!("Could not find vocos_config.json. Did you run convert.py?");
+        };
 
-    let vocos_config: VocosConfig = serde_json::from_str(&std::fs::read_to_string(vocos_config_path)?)?;
-    let vb_vocos = unsafe { VarBuilder::from_mmaped_safetensors(&[vocos_weights_path], DType::F32, &device)? };
+    let vocos_config: VocosConfig =
+        serde_json::from_str(&std::fs::read_to_string(vocos_config_path)?)?;
+    let vb_vocos =
+        unsafe { VarBuilder::from_mmaped_safetensors(&[vocos_weights_path], DType::F32, &device)? };
     let vocos = SopranoDecoder::new(&vocos_config, vb_vocos)?;
 
     // 4. Inference - Qwen
     println!("Generating tokens...");
-    let prompt = format!("[STOP][TEXT]{}[START]", args.prompt);
-    let tokens = tokenizer.encode(prompt, true).map_err(E::msg)?;
+    let cleaned_prompt = clean_text(&args.prompt);
+    let prompt = format!("[STOP][TEXT]{}[START]", cleaned_prompt);
+    let tokens = tokenizer.encode(prompt, false).map_err(E::msg)?; // Use false for add_special_tokens
+    println!("Prompt tokens: {:?}", tokens.get_ids());
     let input_ids = Tensor::new(tokens.get_ids(), &device)?.unsqueeze(0)?;
 
     // Generate loop
     let mut generated_tokens = Vec::new();
     let mut generated_hidden_states = Vec::new();
     let mut current_input = input_ids;
+    let mut all_tokens = tokens.get_ids().to_vec();
     let mut pos = 0;
 
+    let temperature = 0.3f32;
+    let repetition_penalty = 1.2f32;
+
     println!("Generating tokens (this may take a while)...");
-    for _ in 0..200 { // Limit to 200 tokens for test
+    for iter in 0..256 {
+        // Generate more tokens
         let (logits, hidden_states) = qwen.forward(&current_input, pos)?;
-        let logits = logits.squeeze(0)?.get(logits.dim(1)? - 1)?; // Last token logits
 
-        // Greedy decoding
-        let next_token = logits.argmax(0)?.to_scalar::<u32>()?;
-        generated_tokens.push(next_token);
-
-        // Save hidden state for this token
-        // hidden_states is (B, L, H) -> (1, L, H)
-        // We want the last hidden state corresponding to the newly generated token?
-        // Wait, qwen forward returns hidden states for the input tokens.
-        // If we pass input tokens, we get their hidden states.
-        // We want the hidden state of the token we just predicted? No, usually the hidden state that *produced* the prediction.
-        // In autoregressive models, h_t is used to predict x_{t+1}.
-        // So for token x_{t+1}, the code (audio info) is in h_t.
-        // tts.py says: "hidden_state = response['hidden_state']". This likely refers to the hidden state of the last token processed.
-
-        let last_hidden = hidden_states.squeeze(0)?.get(hidden_states.dim(1)? - 1)?; // (H)
-        generated_hidden_states.push(last_hidden);
-
-        // Check for stop condition
-        if let Some(eos) = tokenizer.get_vocab(true).get("<|endoftext|>") {
-            if next_token == *eos {
-                break;
-            }
+        // Debug: print hidden states info on first iteration
+        if iter == 0 {
+            let hs_shape = hidden_states.dims();
+            println!("DEBUG: Hidden states shape: {:?}", hs_shape);
+            let last_pos_hs = hidden_states.squeeze(0)?.get(hidden_states.dim(1)? - 1)?;
+            let hs_vec = last_pos_hs.to_vec1::<f32>()?;
+            println!(
+                "DEBUG: Hidden states at last position (first 10): {:?}",
+                &hs_vec[..10]
+            );
+            let min_val = hs_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_val = hs_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            println!(
+                "DEBUG: Hidden states range: [{:.4}, {:.4}]",
+                min_val, max_val
+            );
         }
+
+        let mut logits = logits.squeeze(0)?.get(logits.dim(1)? - 1)?; // Last token logits
+
+        // Repetition penalty
+        if repetition_penalty != 1.0 {
+            let mut logits_vec = logits.to_vec1::<f32>()?;
+            for &t in all_tokens.iter() {
+                let t = t as usize;
+                if t < logits_vec.len() {
+                    if logits_vec[t] < 0.0 {
+                        logits_vec[t] *= repetition_penalty;
+                    } else {
+                        logits_vec[t] /= repetition_penalty;
+                    }
+                }
+            }
+            logits = Tensor::from_vec(logits_vec, logits.dims(), logits.device())?;
+        }
+
+        // Sampling
+        let next_token = if temperature > 0.0 {
+            let prs = candle_nn::ops::softmax_last_dim(&(logits / (temperature as f64))?)?;
+            let prs_vec = prs.to_vec1::<f32>()?;
+
+            // Simple sampling
+            let mut r = rand::random::<f32>();
+            let mut token = 0;
+            for (i, &p) in prs_vec.iter().enumerate() {
+                r -= p;
+                if r <= 0.0 {
+                    token = i as u32;
+                    break;
+                }
+            }
+            token
+        } else {
+            logits.argmax(0)?.to_scalar::<u32>()?
+        };
+
+        // Check for stop condition BEFORE collecting hidden state
+        // Python filters out EOS token hidden states
+        if next_token == 3 {
+            // [STOP] id is 3
+            break;
+        }
+
+        generated_tokens.push(next_token);
+        all_tokens.push(next_token);
+
+        // Collect hidden states only for non-EOS tokens
+        let last_hidden = hidden_states.squeeze(0)?.get(hidden_states.dim(1)? - 1)?;
+        generated_hidden_states.push(last_hidden);
 
         current_input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
         pos += current_input.dim(1)?;
@@ -134,12 +219,42 @@ fn main() -> Result<()> {
 
     let hidden_dim = generated_hidden_states[0].dim(0)?;
     let hidden_tensor = Tensor::stack(&generated_hidden_states, 0)?; // (L, H)
-    let hidden_tensor = hidden_tensor.unsqueeze(0)?.transpose(1, 2)?; // (1, H, L) as expected by Vocos (B, C, T)
+    let hidden_tensor = hidden_tensor.unsqueeze(0)?.transpose(1, 2)?.contiguous()?; // (1, H, L) as expected by Vocos (B, C, T)
 
     // 6. Decode
     println!("Decoding audio...");
     // Vocos forward expects (B, C, T)
-    let audio_vec = vocos.forward(&hidden_tensor)?;
+    let mut audio_vec = vocos.forward(&hidden_tensor)?;
+
+    if audio_vec.is_empty() {
+        anyhow::bail!("Decoded audio is empty.");
+    }
+
+    // Python takes audio from the END: audio[-(lengths[i]*TOKEN_SIZE - TOKEN_SIZE):]
+    // This means we take (num_tokens - 1) * token_size samples from the end
+    let token_size = 2048;
+    let num_tokens = generated_hidden_states.len();
+    let expected_samples = if num_tokens > 1 {
+        (num_tokens - 1) * token_size
+    } else {
+        audio_vec.len()
+    };
+    let audio_vec = if audio_vec.len() > expected_samples {
+        // Take from the END of the audio, like Python does
+        audio_vec[audio_vec.len() - expected_samples..].to_vec()
+    } else {
+        audio_vec
+    };
+
+    let min_audio = audio_vec.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+    let max_audio = audio_vec.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    println!(
+        "Audio stats: len={}, min={:.4}, max={:.4}",
+        audio_vec.len(),
+        min_audio,
+        max_audio
+    );
+    println!("Generated tokens: {:?}", generated_tokens);
 
     // 7. Save to WAV
     println!("Saving to {}...", args.output);

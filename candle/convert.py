@@ -24,7 +24,7 @@ def convert():
     # I should check how `decoder` is initialized in `soprano/tts.py`.
 
     print("Saving weights to decoder.safetensors...")
-    save_file(state_dict, "candle/decoder.safetensors")
+    save_file(state_dict, "decoder.safetensors")
 
     print("Done.")
 
