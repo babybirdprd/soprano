@@ -480,23 +480,6 @@ impl SopranoDecoder {
         let re = (mag.clone() * cos_p)?;
         let im = (mag * sin_p)?;
 
-        // Get dimensions first, before any conditional processing
-        let (b, f, t_out) = re.dims3()?;
-
-        // For "center" padding, zero DC (bin 0) and Nyquist (last bin)
-        // Python: spec[:,0] = 0; spec[:,-1] = 0
-        let (re, im) = if self.head.padding == "center" && f > 2 {
-            let re_inner = re.narrow(1, 1, f - 2)?; // Skip first, skip last
-            let im_inner = im.narrow(1, 1, f - 2)?;
-            let zeros_shape = (b, 1, t_out);
-            let zeros = Tensor::zeros(zeros_shape, re_inner.dtype(), re_inner.device())?;
-            let re_new = Tensor::cat(&[&zeros, &re_inner, &zeros], 1)?; // Add back DC and Nyquist as zeros
-            let im_new = Tensor::cat(&[&zeros, &im_inner, &zeros], 1)?;
-            (re_new, im_new)
-        } else {
-            (re, im)
-        };
-
         // ISTFT
         // re, im: (B, F, T)
         let (_, f, t_out) = re.dims3()?;

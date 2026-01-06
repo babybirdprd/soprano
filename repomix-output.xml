@@ -81009,1439 +81009,6 @@ except Exception as e:
 }
 </file>
 
-<file path="candle/Cargo.toml">
-[package]
-name = "soprano-candle"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-candle-core = "0.8.4"
-candle-nn = "0.8.4"
-candle-transformers = "0.8.4"
-tokenizers = "0.22"
-anyhow = "1.0"
-hound = "3.5"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-clap = { version = "4.4", features = ["derive"] }
-hf-hub = "0.4"
-rand = "0.8"
-</file>
-
-<file path="candle/convert.py">
-import torch
-import json
-import os
-from safetensors.torch import save_file
-from huggingface_hub import hf_hub_download
-
-def convert():
-    print("Downloading model...")
-    repo_id = "ekwek/Soprano-80M"
-    decoder_path = hf_hub_download(repo_id=repo_id, filename="decoder.pth")
-    config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
-
-    print("Loading weights...")
-    state_dict = torch.load(decoder_path, map_location="cpu")
-
-    # Extract config
-    # The config.json in the repo is likely for Qwen.
-    # The Vocos config might be hardcoded in the Python code or passed in arguments.
-    # Looking at tts.py (not read yet) or decoder.py might reveal how it's initialized.
-    # But decoder.pth only contains weights.
-
-    # Wait, the prompt says "Extract the Vocos configuration (dim, layers, etc.) into a JSON file".
-    # Since I don't see a vocos_config.json in the repo file list (I haven't listed repo files via tool, just guessed),
-    # I should check how `decoder` is initialized in `soprano/tts.py`.
-
-    print("Saving weights to decoder.safetensors...")
-    save_file(state_dict, "decoder.safetensors")
-
-    print("Done.")
-
-if __name__ == "__main__":
-    convert()
-</file>
-
-<file path="candle/src/main.rs">
-use anyhow::{Error as E, Result};
-use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-// use candle_transformers::models::qwen2::{Config as QwenConfig, ModelForCausalLM as QwenModel};
-use clap::Parser;
-use hf_hub::{api::sync::Api, Repo, RepoType};
-use hound;
-use tokenizers::Tokenizer;
-
-mod vocos;
-use vocos::{SopranoDecoder, VocosConfig};
-mod qwen;
-use qwen::{Config as QwenConfig, ModelForCausalLM as QwenModel};
-
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    #[arg(
-        short,
-        long,
-        default_value = "Hello world! This is a test of the Soprano text to speech model port to Rust using Candle."
-    )]
-    prompt: String,
-
-    #[arg(long, default_value = "output.wav")]
-    output: String,
-
-    #[arg(long)]
-    cpu: bool,
-}
-
-fn clean_text(text: &str) -> String {
-    // Basic cleaning: lowercase and remove non-alphabetical/basic punctuation
-    let text = text.to_lowercase();
-    let mut cleaned = String::new();
-    for c in text.chars() {
-        if c.is_alphanumeric() || " !$%&'*+,-./0123456789<>?_".contains(c) {
-            cleaned.push(c);
-        }
-    }
-    cleaned
-}
-
-fn main() -> Result<()> {
-    let args = Args::parse();
-
-    let device = if args.cpu {
-        Device::Cpu
-    } else {
-        Device::new_cuda(0).unwrap_or(Device::Cpu)
-    };
-    println!("Using device: {:?}", device);
-
-    // 1. Load Tokenizer
-    println!("Loading tokenizer...");
-    let tokenizer_path = if std::path::Path::new("tokenizer.json").exists() {
-        std::path::PathBuf::from("tokenizer.json")
-    } else {
-        let api = Api::new()?;
-        let repo = api.repo(Repo::new("ekwek/Soprano-80M".to_string(), RepoType::Model));
-        repo.get("tokenizer.json")?
-    };
-    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
-
-    // 2. Load Qwen Model
-    println!("Loading Qwen model...");
-    let (config_path, model_path) = if std::path::Path::new("config.json").exists()
-        && std::path::Path::new("model.safetensors").exists()
-    {
-        (
-            std::path::PathBuf::from("config.json"),
-            std::path::PathBuf::from("model.safetensors"),
-        )
-    } else {
-        let api = Api::new()?;
-        let repo = api.repo(Repo::new("ekwek/Soprano-80M".to_string(), RepoType::Model));
-        (repo.get("config.json")?, repo.get("model.safetensors")?)
-    };
-
-    let config: QwenConfig = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_path], DType::F32, &device)? };
-    let mut qwen = QwenModel::new(&config, vb)?;
-
-    // 3. Load Vocos Model
-    println!("Loading Vocos model...");
-    // We generated vocos_config.json and decoder.safetensors in Phase 1 (convert.py)
-    // Assuming they are in the current directory or generated path.
-    // In Phase 1 we saved them to `candle/`. But this binary runs from `candle/`?
-    // Cargo run usually runs from the package root.
-
-    // Check if files exist, if not look in local `candle/` folder (if run from repo root)
-    let (vocos_config_path, vocos_weights_path) =
-        if std::path::Path::new("vocos_config.json").exists() {
-            ("vocos_config.json", "decoder.safetensors")
-        } else if std::path::Path::new("candle/vocos_config.json").exists() {
-            ("candle/vocos_config.json", "candle/decoder.safetensors")
-        } else {
-            // Fallback: Use Phase 1 output directly if not found
-            anyhow::bail!("Could not find vocos_config.json. Did you run convert.py?");
-        };
-
-    let vocos_config: VocosConfig =
-        serde_json::from_str(&std::fs::read_to_string(vocos_config_path)?)?;
-    let vb_vocos =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[vocos_weights_path], DType::F32, &device)? };
-    let vocos = SopranoDecoder::new(&vocos_config, vb_vocos)?;
-
-    // 4. Inference - Qwen
-    println!("Generating tokens...");
-    let cleaned_prompt = clean_text(&args.prompt);
-    let prompt = format!("[STOP][TEXT]{}[START]", cleaned_prompt);
-    let tokens = tokenizer.encode(prompt, false).map_err(E::msg)?; // Use false for add_special_tokens
-    println!("Prompt tokens: {:?}", tokens.get_ids());
-    let input_ids = Tensor::new(tokens.get_ids(), &device)?.unsqueeze(0)?;
-
-    // Generate loop
-    let mut generated_tokens = Vec::new();
-    let mut generated_hidden_states = Vec::new();
-    let mut current_input = input_ids;
-    let mut all_tokens = tokens.get_ids().to_vec();
-    let mut pos = 0;
-
-    let temperature = 0.3f32;
-    let repetition_penalty = 1.2f32;
-
-    println!("Generating tokens (this may take a while)...");
-    for _ in 0..256 {
-        // Generate more tokens
-        let (logits, hidden_states) = qwen.forward(&current_input, pos)?;
-        let mut logits = logits.squeeze(0)?.get(logits.dim(1)? - 1)?; // Last token logits
-
-        // Repetition penalty
-        if repetition_penalty != 1.0 {
-            let mut logits_vec = logits.to_vec1::<f32>()?;
-            for &t in all_tokens.iter() {
-                let t = t as usize;
-                if t < logits_vec.len() {
-                    if logits_vec[t] < 0.0 {
-                        logits_vec[t] *= repetition_penalty;
-                    } else {
-                        logits_vec[t] /= repetition_penalty;
-                    }
-                }
-            }
-            logits = Tensor::from_vec(logits_vec, logits.dims(), logits.device())?;
-        }
-
-        // Sampling
-        let next_token = if temperature > 0.0 {
-            let prs = candle_nn::ops::softmax_last_dim(&(logits / (temperature as f64))?)?;
-            let prs_vec = prs.to_vec1::<f32>()?;
-
-            // Simple sampling
-            let mut r = rand::random::<f32>();
-            let mut token = 0;
-            for (i, &p) in prs_vec.iter().enumerate() {
-                r -= p;
-                if r <= 0.0 {
-                    token = i as u32;
-                    break;
-                }
-            }
-            token
-        } else {
-            logits.argmax(0)?.to_scalar::<u32>()?
-        };
-
-        // Check for stop condition BEFORE collecting hidden state
-        // Python filters out EOS token hidden states
-        if next_token == 3 {
-            // [STOP] id is 3
-            break;
-        }
-
-        generated_tokens.push(next_token);
-        all_tokens.push(next_token);
-
-        // Collect hidden states only for non-EOS tokens
-        let last_hidden = hidden_states.squeeze(0)?.get(hidden_states.dim(1)? - 1)?;
-        generated_hidden_states.push(last_hidden);
-
-        current_input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
-        pos += current_input.dim(1)?;
-    }
-
-    // 5. Extract Audio Tokens / Hidden States
-    println!("Extracting audio codes...");
-    // We filter tokens that are in the audio range, and keep their corresponding hidden states.
-    // Or does the model only generate audio tokens after [START]?
-    // Soprano prompt format: [STOP][TEXT]...[START] -> Audio tokens follow.
-    // So all generated tokens should be considered audio tokens until stop?
-    // tts.py seems to take all hidden states from the response.
-    // But it does verify if they are valid?
-
-    // Let's assume all generated tokens are part of the audio sequence.
-
-    if generated_hidden_states.is_empty() {
-        anyhow::bail!("No tokens generated.");
-    }
-
-    let hidden_dim = generated_hidden_states[0].dim(0)?;
-    let hidden_tensor = Tensor::stack(&generated_hidden_states, 0)?; // (L, H)
-    let hidden_tensor = hidden_tensor.unsqueeze(0)?.transpose(1, 2)?.contiguous()?; // (1, H, L) as expected by Vocos (B, C, T)
-
-    // 6. Decode
-    println!("Decoding audio...");
-    // Vocos forward expects (B, C, T)
-    let mut audio_vec = vocos.forward(&hidden_tensor)?;
-
-    if audio_vec.is_empty() {
-        anyhow::bail!("Decoded audio is empty.");
-    }
-
-    // Python takes audio from the END: audio[-(lengths[i]*TOKEN_SIZE - TOKEN_SIZE):]
-    // This means we take (num_tokens - 1) * token_size samples from the end
-    let token_size = 2048;
-    let num_tokens = generated_hidden_states.len();
-    let expected_samples = if num_tokens > 1 {
-        (num_tokens - 1) * token_size
-    } else {
-        audio_vec.len()
-    };
-    let audio_vec = if audio_vec.len() > expected_samples {
-        // Take from the END of the audio, like Python does
-        audio_vec[audio_vec.len() - expected_samples..].to_vec()
-    } else {
-        audio_vec
-    };
-
-    let min_audio = audio_vec.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-    let max_audio = audio_vec.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    println!(
-        "Audio stats: len={}, min={:.4}, max={:.4}",
-        audio_vec.len(),
-        min_audio,
-        max_audio
-    );
-    println!("Generated tokens: {:?}", generated_tokens);
-
-    // 7. Save to WAV
-    println!("Saving to {}...", args.output);
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: 32000, // Soprano uses 32kHz? tts.py: wavfile.write(out_path, 32000, ...)
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
-
-    let mut writer = hound::WavWriter::create(&args.output, spec)?;
-    for sample in audio_vec {
-        writer.write_sample(sample)?;
-    }
-    writer.finalize()?;
-
-    println!("Done!");
-
-    Ok(())
-}
-</file>
-
-<file path="candle/src/qwen.rs">
-use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn::{Activation, VarBuilder};
-use std::sync::Arc;
-use serde::Deserialize;
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct Config {
-    pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
-    pub num_hidden_layers: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub max_position_embeddings: usize,
-    pub sliding_window: Option<usize>,
-    pub max_window_layers: Option<usize>,
-    pub tie_word_embeddings: bool,
-    pub rope_theta: f64,
-    pub rms_norm_eps: f64,
-    pub use_sliding_window: bool,
-    pub hidden_act: Activation,
-    pub attention_bias: bool,
-}
-
-// Helpers from candle-transformers
-pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<candle_nn::Linear> {
-    let ws = vb.get((out_dim, in_dim), "weight")?;
-    Ok(candle_nn::Linear::new(ws, None))
-}
-
-pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<candle_nn::Linear> {
-    let ws = vb.get((out_dim, in_dim), "weight")?;
-    let bs = vb.get(out_dim, "bias")?;
-    Ok(candle_nn::Linear::new(ws, Some(bs)))
-}
-
-#[derive(Debug, Clone)]
-pub struct RmsNorm {
-    weight: Tensor,
-    eps: f64,
-}
-
-impl RmsNorm {
-    pub fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get(size, "weight")?;
-        Ok(Self { weight, eps })
-    }
-
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x_dtype = x.dtype();
-        let internal_dtype = match x_dtype {
-            DType::F16 | DType::BF16 => DType::F32,
-            d => d,
-        };
-        let hidden_size = x.dim(D::Minus1)?;
-        let x = x.to_dtype(internal_dtype)?;
-        let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / (hidden_size as f64))?;
-        let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
-        let x_normed = x_normed.to_dtype(x_dtype)?;
-        x_normed.broadcast_mul(&self.weight)
-    }
-}
-
-impl Module for RmsNorm {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.forward(x)
-    }
-}
-
-
-#[derive(Debug, Clone)]
-struct RotaryEmbedding {
-    sin: Tensor,
-    cos: Tensor,
-}
-
-impl RotaryEmbedding {
-    fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
-        let dim = cfg.hidden_size / cfg.num_attention_heads;
-        let max_seq_len = cfg.max_position_embeddings;
-        let inv_freq: Vec<_> = (0..dim)
-            .step_by(2)
-            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
-            .collect();
-        let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
-        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(dtype)?
-            .reshape((max_seq_len, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-        Ok(Self {
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
-        })
-    }
-
-    fn apply_rotary_emb_qkv(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        seqlen_offset: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
-        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
-        Ok((q_embed, k_embed))
-    }
-}
-
-#[derive(Debug, Clone)]
-#[allow(clippy::upper_case_acronyms)]
-struct MLP {
-    gate_proj: candle_nn::Linear,
-    up_proj: candle_nn::Linear,
-    down_proj: candle_nn::Linear,
-    act_fn: Activation,
-}
-
-impl MLP {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let hidden_sz = cfg.hidden_size;
-        let intermediate_sz = cfg.intermediate_size;
-        let gate_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("up_proj"))?;
-        let down_proj = linear_no_bias(intermediate_sz, hidden_sz, vb.pp("down_proj"))?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-            act_fn: cfg.hidden_act,
-        })
-    }
-}
-
-impl Module for MLP {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
-        let rhs = xs.apply(&self.up_proj)?;
-        (lhs * rhs)?.apply(&self.down_proj)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Attention {
-    q_proj: candle_nn::Linear,
-    k_proj: candle_nn::Linear,
-    v_proj: candle_nn::Linear,
-    o_proj: candle_nn::Linear,
-    num_heads: usize,
-    num_kv_heads: usize,
-    num_kv_groups: usize,
-    head_dim: usize,
-    hidden_size: usize,
-    rotary_emb: Arc<RotaryEmbedding>,
-    kv_cache: Option<(Tensor, Tensor)>,
-}
-
-impl Attention {
-    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let hidden_sz = cfg.hidden_size;
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let num_kv_groups = num_heads / num_kv_heads;
-        let head_dim = hidden_sz / num_heads;
-        
-        let q_proj = if cfg.attention_bias {
-            linear(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?
-        } else {
-            linear_no_bias(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?
-        };
-        
-        let k_proj = if cfg.attention_bias {
-            linear(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?
-        } else {
-            linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?
-        };
-        
-        let v_proj = if cfg.attention_bias {
-            linear(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?
-        } else {
-            linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?
-        };
-        
-        let o_proj = linear_no_bias(num_heads * head_dim, hidden_sz, vb.pp("o_proj"))?;
-        Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            num_heads,
-            num_kv_heads,
-            num_kv_groups,
-            head_dim,
-            hidden_size: hidden_sz,
-            rotary_emb,
-            kv_cache: None,
-        })
-    }
-
-    fn forward(
-        &mut self,
-        xs: &Tensor,
-        attention_mask: Option<&Tensor>,
-        seqlen_offset: usize,
-    ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-
-        let query_states = self.q_proj.forward(xs)?;
-        let key_states = self.k_proj.forward(xs)?;
-        let value_states = self.v_proj.forward(xs)?;
-
-        let query_states = query_states
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let key_states = key_states
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let value_states = value_states
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let (query_states, key_states) =
-            self.rotary_emb
-                .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
-
-        let (key_states, value_states) = match &self.kv_cache {
-            None => (key_states, value_states),
-            Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                (key_states, value_states)
-            }
-        };
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
-
-        // repeat kv
-        let key_states = if self.num_kv_groups > 1 {
-            let (b, n_kv, l, d) = key_states.dims4()?;
-             key_states.unsqueeze(2)?.repeat((1, 1, self.num_kv_groups, 1, 1))?.reshape((b, n_kv * self.num_kv_groups, l, d))?
-        } else {
-            key_states
-        };
-        let value_states = if self.num_kv_groups > 1 {
-             let (b, n_kv, l, d) = value_states.dims4()?;
-             value_states.unsqueeze(2)?.repeat((1, 1, self.num_kv_groups, 1, 1))?.reshape((b, n_kv * self.num_kv_groups, l, d))?
-        } else {
-            value_states
-        };
-
-        let attn_output = {
-            let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-            let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
-
-            let attn_weights = match attention_mask {
-                None => attn_weights,
-                Some(mask) => attn_weights.broadcast_add(mask)?,
-            };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            attn_weights.matmul(&value_states)?
-        };
-        attn_output
-            .transpose(1, 2)?
-            .reshape((b_sz, q_len, self.hidden_size))?
-            .apply(&self.o_proj)
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.kv_cache = None
-    }
-}
-
-#[derive(Debug, Clone)]
-struct DecoderLayer {
-    self_attn: Attention,
-    mlp: MLP,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
-}
-
-impl DecoderLayer {
-    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"))?;
-        let mlp = MLP::new(cfg, vb.pp("mlp"))?;
-        let input_layernorm =
-            RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let post_attention_layernorm = RmsNorm::new(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
-        )?;
-        Ok(Self {
-            self_attn,
-            mlp,
-            input_layernorm,
-            post_attention_layernorm,
-        })
-    }
-
-    fn forward(
-        &mut self,
-        xs: &Tensor,
-        attention_mask: Option<&Tensor>,
-        seqlen_offset: usize,
-    ) -> Result<Tensor> {
-        let residual = xs;
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
-        let xs = (xs + residual)?;
-        let residual = &xs;
-        let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
-        residual + xs
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.self_attn.clear_kv_cache()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Model {
-    embed_tokens: candle_nn::Embedding,
-    layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
-    sliding_window: usize,
-    device: Device,
-    dtype: DType,
-}
-
-impl Model {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let vb_m = vb.pp("model");
-        let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        let vb_l = vb_m.pp("layers");
-        for layer_idx in 0..cfg.num_hidden_layers {
-            let layer = DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_idx))?;
-            layers.push(layer)
-        }
-        let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
-        Ok(Self {
-            embed_tokens,
-            layers,
-            norm,
-            sliding_window: cfg.sliding_window.unwrap_or(0),
-            device: vb.device().clone(),
-            dtype: vb.dtype(),
-        })
-    }
-
-    fn prepare_causal_attention_mask(
-        &self,
-        b_size: usize,
-        tgt_len: usize,
-        seqlen_offset: usize,
-    ) -> Result<Tensor> {
-        // Simple causal mask
-        let mask: Vec<_> = (0..tgt_len)
-            .flat_map(|i| {
-                (0..tgt_len).map(move |j| {
-                    if i < j {
-                        f32::NEG_INFINITY
-                    } else {
-                        0.
-                    }
-                })
-            })
-            .collect();
-        let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?;
-        let mask = if seqlen_offset > 0 {
-            let mask0 = Tensor::zeros((tgt_len, seqlen_offset), self.dtype, &self.device)?;
-            Tensor::cat(&[&mask0, &mask], D::Minus1)?
-        } else {
-            mask
-        };
-        mask.expand((b_size, 1, tgt_len, tgt_len + seqlen_offset))?
-            .to_dtype(self.dtype)
-    }
-
-    fn prepare_attention_mask(&self, attn_mask: &Tensor) -> Result<Tensor> {
-        let (b_sz, sql_len) = attn_mask.dims2()?;
-        let mut mask: Vec<Tensor> = vec![];
-        for b in 0..b_sz {
-            mask.push(attn_mask.i((b, ..))?.expand((1, 1, sql_len, sql_len))?);
-        }
-        let mask = Tensor::cat(&mask, 0)?;
-        let on_true = mask.zeros_like()?.to_dtype(self.dtype)?;
-        let on_false = Tensor::new(f32::NEG_INFINITY, &self.device)?
-            .broadcast_as(mask.shape())?
-            .to_dtype(self.dtype)?;
-        mask.where_cond(&on_true, &on_false)
-    }
-
-    pub fn forward(
-        &mut self,
-        input_ids: &Tensor,
-        seqlen_offset: usize,
-        attn_mask: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        let (b_size, seq_len) = input_ids.dims2()?;
-        let attention_mask: Option<Tensor> = match attn_mask {
-            Some(mask) => Some(self.prepare_attention_mask(mask)?),
-            None => {
-                if seq_len <= 1 {
-                    None
-                } else {
-                    Some(self.prepare_causal_attention_mask(b_size, seq_len, seqlen_offset)?)
-                }
-            }
-        };
-        let mut xs = self.embed_tokens.forward(input_ids)?;
-        for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?
-        }
-        xs.apply(&self.norm)
-    }
-
-    pub fn clear_kv_cache(&mut self) {
-        for layer in self.layers.iter_mut() {
-            layer.clear_kv_cache()
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ModelForCausalLM {
-    base_model: Model,
-    lm_head: candle_nn::Linear,
-}
-
-impl ModelForCausalLM {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let base_model = Model::new(cfg, vb.clone())?;
-        let lm_head = if vb.contains_tensor("lm_head.weight") {
-            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
-        } else {
-            candle_nn::Linear::new(base_model.embed_tokens.embeddings().clone(), None)
-        };
-        Ok(Self {
-            base_model,
-            lm_head,
-        })
-    }
-
-    // Modified forward to return both logits and hidden states
-    pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<(Tensor, Tensor)> {
-        let (_b_size, seq_len) = input_ids.dims2()?;
-        let hidden_states = self.base_model
-            .forward(input_ids, seqlen_offset, None)?;
-
-        let logits = hidden_states
-            .narrow(1, seq_len - 1, 1)?
-            .apply(&self.lm_head)?;
-
-        Ok((logits, hidden_states))
-    }
-
-    pub fn clear_kv_cache(&mut self) {
-        self.base_model.clear_kv_cache()
-    }
-}
-</file>
-
-<file path="candle/src/vocos.rs">
-use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{Conv1d, Conv1dConfig, LayerNorm, Linear, Module, VarBuilder};
-use serde::Deserialize;
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct VocosConfig {
-    pub num_input_channels: usize,
-    pub decoder_num_layers: usize,
-    pub decoder_dim: usize,
-    pub decoder_intermediate_dim: usize,
-    pub hop_length: usize,
-    pub n_fft: usize,
-    pub upscale: usize,
-    pub dw_kernel: usize,
-}
-
-struct ConvNeXtBlock {
-    dwconv: Conv1d,
-    norm: LayerNorm,
-    pwconv1: Linear,
-    pwconv2: Linear,
-    gamma: Option<Tensor>,
-}
-
-impl ConvNeXtBlock {
-    fn new(
-        dim: usize,
-        intermediate_dim: usize,
-        layer_scale_init_value: Option<f64>,
-        dw_kernel_size: usize,
-        vb: VarBuilder,
-    ) -> Result<Self> {
-        let dwconv_cfg = Conv1dConfig {
-            padding: dw_kernel_size / 2,
-            groups: dim,
-            ..Default::default()
-        };
-        let dwconv = candle_nn::conv1d(dim, dim, dw_kernel_size, dwconv_cfg, vb.pp("dwconv"))?;
-        let norm = candle_nn::layer_norm(dim, 1e-6, vb.pp("norm"))?;
-        let pwconv1 = candle_nn::linear(dim, intermediate_dim, vb.pp("pwconv1"))?;
-        let pwconv2 = candle_nn::linear(intermediate_dim, dim, vb.pp("pwconv2"))?;
-
-        let gamma = if let Some(init_value) = layer_scale_init_value {
-            if init_value > 0.0 {
-                // In PyTorch: nn.Parameter(layer_scale_init_value * torch.ones(dim), requires_grad=True)
-                // In safetensors, this parameter is stored as "gamma".
-                // If it exists in the weights, we load it.
-                // However, the logic in python checks init_value > 0 to decide whether to create it.
-                // We should check if "gamma" exists in vb.
-                if vb.contains_tensor("gamma") {
-                    Some(vb.get(dim, "gamma")?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            // If layer_scale_init_value is None, check if gamma exists anyway (maybe passed differently or default behaviour)
-            if vb.contains_tensor("gamma") {
-                Some(vb.get(dim, "gamma")?)
-            } else {
-                None
-            }
-        };
-
-        Ok(Self {
-            dwconv,
-            norm,
-            pwconv1,
-            pwconv2,
-            gamma,
-        })
-    }
-}
-
-impl Module for ConvNeXtBlock {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let residual = x.clone();
-        let x = self.dwconv.forward(x)?;
-        // x: (B, C, T) -> (B, T, C)
-        let x = x.transpose(1, 2)?;
-        let x = self.norm.forward(&x)?;
-        let x = self.pwconv1.forward(&x)?;
-        let x = x.gelu()?;
-        let x = self.pwconv2.forward(&x)?;
-
-        let x = if let Some(gamma) = &self.gamma {
-            // gamma is (C), x is (B, T, C)
-            // broadcasting happens on last dim automatically?
-            // Candle broadcasting: if shapes match from right.
-            // gamma: (C), x: (B, T, C). Yes.
-            x.broadcast_mul(gamma)?
-        } else {
-            x
-        };
-
-        let x = x.transpose(1, 2)?; // (B, C, T)
-
-        // Residual connection
-        residual + x
-    }
-}
-
-struct VocosBackbone {
-    embed: Conv1d,
-    norm: LayerNorm,
-    convnext: Vec<ConvNeXtBlock>,
-    final_layer_norm: LayerNorm,
-}
-
-impl VocosBackbone {
-    fn new(cfg: &VocosConfig, vb: VarBuilder) -> Result<Self> {
-        let input_channels = cfg.num_input_channels;
-        let dim = cfg.decoder_dim;
-        let intermediate_dim = cfg.decoder_intermediate_dim;
-        let num_layers = cfg.decoder_num_layers;
-        let dw_kernel_size = cfg.dw_kernel;
-        let input_kernel_size = dw_kernel_size;
-
-        // Python:
-        // layer_scale_init_value or 1 / num_layers**0.5
-        let layer_scale_init_value = 1.0 / (num_layers as f64).sqrt();
-
-        let embed_cfg = Conv1dConfig {
-            padding: input_kernel_size / 2,
-            ..Default::default()
-        };
-        let embed = candle_nn::conv1d(
-            input_channels,
-            dim,
-            input_kernel_size,
-            embed_cfg,
-            vb.pp("embed"),
-        )?;
-        let norm = candle_nn::layer_norm(dim, 1e-6, vb.pp("norm"))?;
-
-        let mut convnext = Vec::new();
-        let vb_conv = vb.pp("convnext");
-        for i in 0..num_layers {
-            let block = ConvNeXtBlock::new(
-                dim,
-                intermediate_dim,
-                Some(layer_scale_init_value),
-                dw_kernel_size,
-                vb_conv.pp(i),
-            )?;
-            convnext.push(block);
-        }
-
-        let final_layer_norm = candle_nn::layer_norm(dim, 1e-6, vb.pp("final_layer_norm"))?;
-
-        Ok(Self {
-            embed,
-            norm,
-            convnext,
-            final_layer_norm,
-        })
-    }
-}
-
-impl Module for VocosBackbone {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mut x = self.embed.forward(x)?;
-        x = x.transpose(1, 2)?;
-        x = self.norm.forward(&x)?;
-        x = x.transpose(1, 2)?;
-
-        for block in &self.convnext {
-            x = block.forward(&x)?;
-        }
-
-        x = x.transpose(1, 2)?;
-        x = self.final_layer_norm.forward(&x)?;
-        x = x.transpose(1, 2)?;
-        Ok(x)
-    }
-}
-
-struct ISTFTHead {
-    out: Linear,
-    n_fft: usize,
-    hop_length: usize,
-    win_length: usize,
-    padding: String,
-    window: Tensor,
-}
-
-impl ISTFTHead {
-    fn new(cfg: &VocosConfig, vb: VarBuilder) -> Result<Self> {
-        let dim = cfg.decoder_dim;
-        let n_fft = cfg.n_fft;
-        let hop_length = cfg.hop_length;
-        let win_length = n_fft; // In Python code: win_length=n_fft
-        let padding = "center".to_string(); // Python default is "center"
-
-        let out_dim = n_fft + 2;
-        let out = candle_nn::linear(dim, out_dim, vb.pp("out"))?;
-
-        // Window: torch.hann_window(win_length)
-        // We need to generate hann window.
-        // Formula: 0.5 * (1 - cos(2 * pi * n / (M - 1)))
-        // 0 <= n <= M-1
-        let window = hann_window(win_length, vb.device())?;
-
-        Ok(Self {
-            out,
-            n_fft,
-            hop_length,
-            win_length,
-            padding,
-            window,
-        })
-    }
-
-    fn istft(&self, real: &Tensor, imag: &Tensor) -> Result<Tensor> {
-        // real, imag: (B, N, T) where N = n_fft/2 + 1 usually for rfft, but here input is full spectrum?
-        // Wait, Python code says:
-        // ifft = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
-        // spec is complex.
-
-        // In python:
-        // x = self.out(x.transpose(1,2)).transpose(1, 2)
-        // mag, p = x.chunk(2, dim=1)
-        // ...
-        // S = mag * (x + 1j * y) -> S shape (B, N_FFT/2 + 1, T) usually?
-
-        // In Python ISTFTHead:
-        // out_dim = n_fft + 2.
-        // mag, p = x.chunk(2, dim=1) -> each has (n_fft/2 + 1) channels?
-        // No, n_fft + 2 split by 2 is n_fft/2 + 1.
-        // So S has n_fft/2 + 1 frequency bins.
-        // irfft expects this for real output.
-
-        // Candle doesn't have irfft easily accessible or "fold".
-        // We need to implement irfft using inverse dft if possible, or simple IDFT if N is small (2048 is not small).
-        // BUT candle-core might not have FFT operations exposed.
-        // I need to check if I can use a crate or if I have to implement it.
-        // Since I cannot easily add new crates that are not in the environment (unless I can compile them),
-        // I should check what's available. `candle-core` doesn't seem to have FFT.
-        // Actually, maybe I can use `realfft` crate? Or is it pure rust?
-        // Wait, I am allowed to add dependencies in Cargo.toml.
-        // But `candle` is GPU accelerated. If I use CPU FFT, I need to move data back and forth.
-        // If I run on CPU, it's fine.
-
-        // Let's assume we can use a rust FFT library. `rustfft`.
-        // But we need to handle batching.
-
-        // Alternative: Implementing naive IDFT as matrix multiplication?
-        // O(N^2). 2048^2 = 4M ops per column. Might be slow but works on GPU if implemented as matmul.
-        // We need IDFT matrix.
-        // IDFT(k, n) = 1/N * exp(i * 2*pi * k * n / N)
-        // Since we are doing irfft (inverse real fft), the input is half spectrum.
-        // Reconstructing full spectrum and then IDFT?
-
-        // Constructing IDFT matrix:
-        // W[n, k] = exp(i * 2*pi * n * k / N)
-        // We want x[n] = 1/N * sum_k X[k] * W[n, k]
-        // Since output is real, we can optimize.
-
-        // Let's implement it using matrix multiplication for now.
-        // It might be memory intensive if batch size or sequence length is large.
-        // B, F, T.
-        // We operate on F dim.
-        // We need (N, F) matrix.
-        // Output (B, N, T).
-
-        // Steps:
-        // 1. Reconstruct full complex spectrum from half spectrum (S).
-        //    S: (B, N_freq, T). N_freq = n_fft/2 + 1.
-        //    Full spectrum S_full: (B, n_fft, T).
-        //    S_full[0] = S[0]
-        //    S_full[k] = S[k] for 1 <= k < N/2
-        //    S_full[N/2] = S[N/2] (Nyquist)
-        //    S_full[N-k] = conj(S[k])
-
-        // 2. IDFT via matrix mult.
-        //    x = (IDFT_matrix @ S_full).real?
-        //    Actually, we can do it with real arithmetic to avoid complex numbers if Candle doesn't support them well.
-        //    x[n] = 1/N * ( X[0] + X[N/2]*cos(pi*n) + 2*sum_{k=1}^{N/2-1} (Re[X[k]]*cos(2pi*k*n/N) - Im[X[k]]*sin(2pi*k*n/N)) )
-
-        //    So we can create a large weight matrix for this transformation.
-        //    Input: Real and Imag parts of S (freqs 0 to N/2).
-        //    Input dim: 2 * (N/2 + 1) = N + 2.
-        //    Output dim: N.
-        //    We can precompute a linear layer that maps (Re, Im) -> Time domain signal window.
-
-        //    Wait, this is exactly what `torch.fft.irfft` does efficiently.
-        //    As a linear operation, it is just a matrix multiplication.
-        //    Weight matrix W of shape (N, N+2).
-        //    We can precompute this W.
-
-        //    This avoids using external FFT libraries and works on GPU with Candle!
-
-        //    Let's precompute the IDFT matrix in `new`.
-
-        let device = real.device();
-        let (b_size, _, t_size) = real.dims3()?;
-
-        // Combine real and imag into one tensor for matmul
-        // We expect real: (B, F, T), imag: (B, F, T) where F = n_fft/2 + 1
-        // We want input (B, T, 2*F) -> Output (B, T, n_fft)
-
-        let real_t = real.transpose(1, 2)?; // (B, T, F)
-        let imag_t = imag.transpose(1, 2)?; // (B, T, F)
-
-        let input = Tensor::cat(&[&real_t, &imag_t], 2)?; // (B, T, 2F)
-
-        // We need a stored IDFT matrix.
-        // It should be registered as a buffer or just a tensor in the struct.
-        // Let's assume we have `self.idft_matrix` of shape (2F, n_fft).
-        // Then input @ idft_matrix -> (B, T, n_fft).
-
-        // Wait, typical Linear is x @ w.t() + b.
-        // So if idft_matrix is (n_fft, 2F), we can use linear or matmul.
-
-        // Need to define idft_matrix in struct and `new`.
-
-        // 3. Overlap-Add (Fold).
-        //    Candle doesn't have `fold`.
-        //    We have frames (B, T, n_fft).
-        //    We need to overlap-add them.
-        //    Output length L approx T * hop_length.
-        //    We can manually implement this by creating a large zero tensor and adding slices.
-        //    But modifying tensors in place is tricky in Candle (immutable mostly?).
-        //    Actually, we can use `scatter_add` if available, or just a loop if T is not too huge.
-        //    Or we can reshape and sum if we can construct the structure correctly.
-
-        //    Let's look at `col2im` or similar? No.
-
-        //    Looping over T frames might be slow in Rust/Candle graph, but maybe okay for inference.
-        //    However, T can be ~100-1000.
-        //    Can we vectorize?
-
-        //    We can use the "reshape and sum" trick for constant overlap-add.
-        //    If `n_fft` is multiple of `hop_length` (e.g. 2048 and 512 -> 4x overlap).
-        //    We can arrange the data into 4 streams and sum them.
-        //
-        //    Frames: 0, 1, 2, 3, 4, 5...
-        //    Stream 0: Frame 0, 4, 8... (padded with zeros in between?)
-        //    This seems complicated to implement generally.
-
-        //    Let's stick to a loop for now, or see if we can optimize.
-        //    Since we are generating audio, T is length of tokens.
-        //    For 10 seconds of audio, T ~ 10s * 24000sr / 512hop ~ 468 frames.
-        //    Looping 500 times is fine in Rust.
-
-        Err(candle_core::Error::Msg("Not implemented".into()))
-    }
-}
-
-fn hann_window(size: usize, device: &Device) -> Result<Tensor> {
-    let mut data = Vec::with_capacity(size);
-    for i in 0..size {
-        let n = i as f64;
-        let m = size as f64;
-        let val = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * n / m).cos()); // Standard Hann window
-                                                                            // Note: PyTorch hann_window might be periodic=True by default which uses M instead of M-1?
-                                                                            // torch.hann_window(window_length, periodic=True, *)
-                                                                            // If periodic=True (default), formula uses N. If periodic=False, uses N-1.
-                                                                            // STFT usually uses periodic window.
-        data.push(val as f32);
-    }
-    Tensor::from_vec(data, (size,), device)
-}
-
-fn make_idft_matrix(n_fft: usize, device: &Device) -> Result<Tensor> {
-    // Construct matrix M of shape (2*(n_fft/2+1), n_fft)
-    // such that [Re(S); Im(S)] @ M = x (time domain)
-    // x[n] = 1/N * sum_{k=0}^{N-1} X[k] exp(i 2pi k n / N)
-    // X[k] comes from Re, Im.
-    // X[k] = Re[k] + i Im[k]
-    // X[N-k] = Re[k] - i Im[k]
-
-    // x[n] = 1/N * [ X[0] + X[N/2]cos(pi n) + sum_{k=1}^{N/2-1} (Re[k] + i Im[k])(cos(...) + i sin(...)) + (Re[k] - i Im[k])(cos(...) - i sin(...)) ]
-    // ... expansion ...
-    // x[n] = 1/N * [ Re[0] + Re[N/2]cos(pi n) + 2 sum_{k=1}^{N/2-1} (Re[k]cos(2pi k n / N) - Im[k]sin(2pi k n / N)) ]
-
-    // So coeffs for Re[0]: 1/N
-    // Coeffs for Re[N/2]: 1/N * cos(pi n)
-    // Coeffs for Re[k]: 2/N * cos(2pi k n / N)
-    // Coeffs for Im[k]: -2/N * sin(2pi k n / N)
-    // Coeffs for Im[0]: 0
-    // Coeffs for Im[N/2]: 0
-
-    let num_freqs = n_fft / 2 + 1;
-    let input_dim = 2 * num_freqs;
-    let mut matrix = vec![0.0f32; input_dim * n_fft]; // Row-major: rows are input channels, cols are output time
-
-    let scale = 1.0 / n_fft as f32;
-
-    for n in 0..n_fft {
-        for k in 0..num_freqs {
-            // Index in flat vector: row * n_fft + col
-            // Row mapping: 0..num_freqs are Real, num_freqs..2*num_freqs are Imag
-
-            let arg = 2.0 * std::f64::consts::PI * (k as f64) * (n as f64) / (n_fft as f64);
-            let cos_v = arg.cos() as f32;
-            let sin_v = arg.sin() as f32;
-
-            let re_idx = k;
-            let im_idx = k + num_freqs;
-
-            let factor = if k == 0 || k == num_freqs - 1 {
-                1.0
-            } else {
-                2.0
-            };
-            // Wait, nyquist index is n_fft/2. num_freqs = n_fft/2 + 1. So last index is n_fft/2.
-
-            // For Re[k]
-            matrix[re_idx * n_fft + n] = scale * factor * cos_v;
-
-            // For Im[k]
-            if k > 0 && k < num_freqs - 1 {
-                matrix[im_idx * n_fft + n] = -scale * factor * sin_v;
-            } else {
-                matrix[im_idx * n_fft + n] = 0.0;
-            }
-        }
-    }
-
-    // Transpose to (n_fft, input_dim) for linear layer?
-    // Linear: x @ w.t(). If we want x @ M, then w = M.t().
-    // Let's keep it as (input_dim, n_fft) and use matmul explicitly or transpose it.
-    // Candle Linear uses weight shape (out_dim, in_dim).
-    // Here out_dim = n_fft, in_dim = 2*num_freqs.
-    // So we need (n_fft, 2*num_freqs).
-    // Our `matrix` vector is currently (in_dim, out_dim) if we view it as rows=in.
-    // Let's create tensor (in_dim, out_dim) and transpose.
-
-    let tensor = Tensor::from_vec(matrix, (input_dim, n_fft), device)?;
-    Ok(tensor) // (input_dim, n_fft)
-}
-
-pub struct SopranoDecoder {
-    decoder: VocosBackbone,
-    head: ISTFTHead,
-    upscale: usize,
-    idft_matrix: Tensor,
-}
-
-impl SopranoDecoder {
-    pub fn new(cfg: &VocosConfig, vb: VarBuilder) -> Result<Self> {
-        let decoder = VocosBackbone::new(cfg, vb.pp("decoder"))?;
-        let head = ISTFTHead::new(cfg, vb.pp("head"))?;
-        let upscale = cfg.upscale;
-        let idft_matrix = make_idft_matrix(cfg.n_fft, vb.device())?;
-
-        Ok(Self {
-            decoder,
-            head,
-            upscale,
-            idft_matrix,
-        })
-    }
-
-    pub fn forward(&self, x: &Tensor) -> Result<Vec<f32>> {
-        // x: (B, C, L)
-        let (b, c, t) = x.dims3()?;
-
-        // Interpolate
-        let x_interp = interpolate_linear(x, self.upscale)?;
-
-        let x_decoded = self.decoder.forward(&x_interp)?;
-
-        // Head
-        let x_head = self.head.out.forward(&x_decoded.transpose(1, 2)?)?; // (B, T, out_dim)
-        let x_head = x_head.transpose(1, 2)?; // (B, out_dim, T)
-
-        let chunks = x_head.chunk(2, 1)?;
-        let mag = &chunks[0];
-        let p = &chunks[1];
-        let mag = mag.exp()?;
-        let mag = mag.clamp(f32::NEG_INFINITY, 100.0)?;
-
-        let cos_p = p.cos()?;
-        let sin_p = p.sin()?;
-
-        let re = (mag.clone() * cos_p)?;
-        let im = (mag * sin_p)?;
-
-        // Get dimensions first, before any conditional processing
-        let (b, f, t_out) = re.dims3()?;
-
-        // For "center" padding, zero DC (bin 0) and Nyquist (last bin)
-        // Python: spec[:,0] = 0; spec[:,-1] = 0
-        let (re, im) = if self.head.padding == "center" && f > 2 {
-            let re_inner = re.narrow(1, 1, f - 2)?; // Skip first, skip last
-            let im_inner = im.narrow(1, 1, f - 2)?;
-            let zeros_shape = (b, 1, t_out);
-            let zeros = Tensor::zeros(zeros_shape, re_inner.dtype(), re_inner.device())?;
-            let re_new = Tensor::cat(&[&zeros, &re_inner, &zeros], 1)?; // Add back DC and Nyquist as zeros
-            let im_new = Tensor::cat(&[&zeros, &im_inner, &zeros], 1)?;
-            (re_new, im_new)
-        } else {
-            (re, im)
-        };
-
-        // ISTFT
-        // re, im: (B, F, T)
-        let (_, f, t_out) = re.dims3()?;
-        let re_t = re.transpose(1, 2)?; // (B, T, F)
-        let im_t = im.transpose(1, 2)?;
-
-        let spectral = Tensor::cat(&[&re_t, &im_t], 2)?.contiguous()?; // (B, T, 2F)
-
-        // Apply IDFT matrix
-        // spectral: (B, T, 2F)
-        // idft_matrix: (2F, n_fft)
-        // output: spectral @ idft_matrix -> (B, T, n_fft)
-        let (b_idft, t_idft, f2_idft) = spectral.dims3()?;
-        let spectral_2d = spectral.reshape((b_idft * t_idft, f2_idft))?;
-        let ifft_2d = spectral_2d.matmul(&self.idft_matrix)?;
-        let ifft = ifft_2d.reshape((b_idft, t_idft, self.head.n_fft))?;
-
-        // Apply window
-        // window: (n_fft)
-        let window = &self.head.window;
-        let ifft = ifft.broadcast_mul(window)?; // (B, T, n_fft)
-
-        // Overlap Add
-        // We need to fold.
-        // Flatten ifft to (B, T*n_fft).
-        // Accumulate into output buffer.
-
-        // Since B=1 usually for TTS, let's optimize for that or just loop.
-        // We return Vec<f32> eventually.
-        // Let's move to CPU and do overlap-add in Rust Vec?
-        // It might be faster than trying to do it in Candle if ops are missing.
-
-        let ifft_vec = ifft.flatten_all()?.to_vec1::<f32>()?;
-        let hop_length = self.head.hop_length;
-        let win_length = self.head.win_length;
-        let n_frames = t_out;
-
-        // Calculate output size
-        let output_size = (n_frames - 1) * hop_length + win_length;
-
-        // For "center" padding (Python default), pad = n_fft // 2
-        // For "same" padding, pad = (win_length - hop_length) // 2
-        let pad = if self.head.padding == "center" {
-            self.head.n_fft / 2
-        } else {
-            (win_length - hop_length) / 2
-        };
-
-        let mut output_audio = vec![0.0f32; output_size];
-        let mut envelope = vec![0.0f32; output_size];
-        let window_vec = window.to_vec1::<f32>()?;
-        let window_sq_vec: Vec<f32> = window_vec.iter().map(|x| x * x).collect();
-
-        for i in 0..n_frames {
-            let start = i * hop_length;
-            let frame_start = i * win_length; // in ifft_vec
-
-            for j in 0..win_length {
-                if start + j < output_size {
-                    output_audio[start + j] += ifft_vec[frame_start + j];
-                    envelope[start + j] += window_sq_vec[j];
-                }
-            }
-        }
-
-        // Normalize and trim padding
-        let end_idx = if output_size > pad {
-            output_size - pad
-        } else {
-            output_size
-        };
-        let start_idx = pad.min(end_idx);
-        let mut result = Vec::with_capacity(end_idx - start_idx);
-
-        for i in start_idx..end_idx {
-            if envelope[i] > 1e-11 {
-                result.push(output_audio[i] / envelope[i]);
-            } else {
-                result.push(output_audio[i]);
-            }
-        }
-
-        Ok(result)
-    }
-}
-
-fn interpolate_linear(x: &Tensor, scale_factor: usize) -> Result<Tensor> {
-    // x: (B, C, T)
-    let (b, c, t) = x.dims3()?;
-    let new_t = scale_factor * (t - 1) + 1;
-
-    // We can use conv1d_transpose
-    // Weight should be fixed to perform linear interpolation.
-    // Kernel size = 2 * scale_factor - 1 ?
-    // Stride = scale_factor.
-    // Padding = scale_factor - 1.
-    // Groups = C.
-
-    // Actually, simpler approach given we don't need gradients:
-    // Create new tensor of size (B, C, new_t)
-    // Fill it.
-    // Since we are in Candle, we want to avoid loops over tensor elements.
-
-    // Let's try to use `upsample_nearest` followed by smoothing? No.
-
-    // Use `gather`.
-    // Generate indices.
-    // For each output index i:
-    // input position p = i / scale_factor
-    // alpha = i % scale_factor / scale_factor
-    // val = x[floor(p)] * (1-alpha) + x[ceil(p)] * alpha
-
-    // Construct index tensors.
-    let device = x.device();
-    let mut indices_floor = Vec::with_capacity(new_t);
-    let mut indices_ceil = Vec::with_capacity(new_t);
-    let mut alphas = Vec::with_capacity(new_t);
-
-    for i in 0..new_t {
-        let p = i as f32 / scale_factor as f32;
-        let p_floor = p.floor() as i64;
-        let p_ceil = p.ceil() as i64;
-
-        // Clamp indices to [0, t-1]
-        let p_floor = p_floor.clamp(0, (t - 1) as i64);
-        let p_ceil = p_ceil.clamp(0, (t - 1) as i64);
-
-        let alpha = p - p.floor();
-
-        indices_floor.push(p_floor);
-        indices_ceil.push(p_ceil);
-        alphas.push(alpha);
-    }
-
-    let idx_floor = Tensor::from_vec(indices_floor, (new_t,), device)?;
-    let idx_ceil = Tensor::from_vec(indices_ceil, (new_t,), device)?;
-    let alpha = Tensor::from_vec(alphas, (1, 1, new_t), device)?;
-
-    // Gather on dim 2
-    let x_floor = x.index_select(&idx_floor, 2)?;
-    let x_ceil = x.index_select(&idx_ceil, 2)?;
-
-    let one_minus_alpha = (1.0 - alpha.clone())?;
-
-    let res = (x_floor.broadcast_mul(&one_minus_alpha)? + x_ceil.broadcast_mul(&alpha)?)?;
-
-    Ok(res)
-}
-</file>
-
 <file path="candle/vocos_config.json">
 {
     "num_input_channels": 512,
@@ -83056,6 +81623,1454 @@ class ISTFT(nn.Module):
 <file path="candle/.gitignore">
 target/
 *.safetensors
+</file>
+
+<file path="candle/Cargo.toml">
+[package]
+name = "soprano-candle"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+candle-core = "0.8.4"
+candle-nn = "0.8.4"
+candle-transformers = "0.8.4"
+tokenizers = "0.22"
+anyhow = "1.0"
+hound = "3.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+hf-hub = "0.4"
+rand = "0.8"
+</file>
+
+<file path="candle/convert.py">
+import torch
+import json
+import os
+from safetensors.torch import save_file
+from huggingface_hub import hf_hub_download
+
+def convert():
+    print("Downloading model...")
+    repo_id = "ekwek/Soprano-80M"
+    decoder_path = hf_hub_download(repo_id=repo_id, filename="decoder.pth")
+    config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
+
+    print("Loading weights...")
+    state_dict = torch.load(decoder_path, map_location="cpu")
+
+    # Extract config
+    # The config.json in the repo is likely for Qwen.
+    # The Vocos config might be hardcoded in the Python code or passed in arguments.
+    # Looking at tts.py (not read yet) or decoder.py might reveal how it's initialized.
+    # But decoder.pth only contains weights.
+
+    # Wait, the prompt says "Extract the Vocos configuration (dim, layers, etc.) into a JSON file".
+    # Since I don't see a vocos_config.json in the repo file list (I haven't listed repo files via tool, just guessed),
+    # I should check how `decoder` is initialized in `soprano/tts.py`.
+
+    print("Saving weights to decoder.safetensors...")
+    save_file(state_dict, "decoder.safetensors")
+
+    print("Done.")
+
+if __name__ == "__main__":
+    convert()
+</file>
+
+<file path="candle/src/main.rs">
+use anyhow::{Error as E, Result};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+// use candle_transformers::models::qwen2::{Config as QwenConfig, ModelForCausalLM as QwenModel};
+use clap::Parser;
+use hf_hub::{api::sync::Api, Repo, RepoType};
+use hound;
+use tokenizers::Tokenizer;
+
+mod vocos;
+use vocos::{SopranoDecoder, VocosConfig};
+mod qwen;
+use qwen::{Config as QwenConfig, ModelForCausalLM as QwenModel};
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(
+        short,
+        long,
+        default_value = "Hello world! This is a test of the Soprano text to speech model port to Rust using Candle."
+    )]
+    prompt: String,
+
+    #[arg(long, default_value = "output.wav")]
+    output: String,
+
+    #[arg(long)]
+    cpu: bool,
+}
+
+fn clean_text(text: &str) -> String {
+    // Basic cleaning: lowercase and remove non-alphabetical/basic punctuation
+    let text = text.to_lowercase();
+    let mut cleaned = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() || " !$%&'*+,-./0123456789<>?_".contains(c) {
+            cleaned.push(c);
+        }
+    }
+    cleaned
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let device = if args.cpu {
+        Device::Cpu
+    } else {
+        Device::new_cuda(0).unwrap_or(Device::Cpu)
+    };
+    println!("Using device: {:?}", device);
+
+    // 1. Load Tokenizer
+    println!("Loading tokenizer...");
+    let tokenizer_path = if std::path::Path::new("tokenizer.json").exists() {
+        std::path::PathBuf::from("tokenizer.json")
+    } else {
+        let api = Api::new()?;
+        let repo = api.repo(Repo::new("ekwek/Soprano-80M".to_string(), RepoType::Model));
+        repo.get("tokenizer.json")?
+    };
+    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
+
+    // 2. Load Qwen Model
+    println!("Loading Qwen model...");
+    let (config_path, model_path) = if std::path::Path::new("config.json").exists()
+        && std::path::Path::new("model.safetensors").exists()
+    {
+        (
+            std::path::PathBuf::from("config.json"),
+            std::path::PathBuf::from("model.safetensors"),
+        )
+    } else {
+        let api = Api::new()?;
+        let repo = api.repo(Repo::new("ekwek/Soprano-80M".to_string(), RepoType::Model));
+        (repo.get("config.json")?, repo.get("model.safetensors")?)
+    };
+
+    let config: QwenConfig = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_path], DType::F32, &device)? };
+    let mut qwen = QwenModel::new(&config, vb)?;
+
+    // 3. Load Vocos Model
+    println!("Loading Vocos model...");
+    // We generated vocos_config.json and decoder.safetensors in Phase 1 (convert.py)
+    // Assuming they are in the current directory or generated path.
+    // In Phase 1 we saved them to `candle/`. But this binary runs from `candle/`?
+    // Cargo run usually runs from the package root.
+
+    // Check if files exist, if not look in local `candle/` folder (if run from repo root)
+    let (vocos_config_path, vocos_weights_path) =
+        if std::path::Path::new("vocos_config.json").exists() {
+            ("vocos_config.json", "decoder.safetensors")
+        } else if std::path::Path::new("candle/vocos_config.json").exists() {
+            ("candle/vocos_config.json", "candle/decoder.safetensors")
+        } else {
+            // Fallback: Use Phase 1 output directly if not found
+            anyhow::bail!("Could not find vocos_config.json. Did you run convert.py?");
+        };
+
+    let vocos_config: VocosConfig =
+        serde_json::from_str(&std::fs::read_to_string(vocos_config_path)?)?;
+    let vb_vocos =
+        unsafe { VarBuilder::from_mmaped_safetensors(&[vocos_weights_path], DType::F32, &device)? };
+    let vocos = SopranoDecoder::new(&vocos_config, vb_vocos)?;
+
+    // 4. Inference - Qwen
+    println!("Generating tokens...");
+    let cleaned_prompt = clean_text(&args.prompt);
+    let prompt = format!("[STOP][TEXT]{}[START]", cleaned_prompt);
+    let tokens = tokenizer.encode(prompt, false).map_err(E::msg)?; // Use false for add_special_tokens
+    println!("Prompt tokens: {:?}", tokens.get_ids());
+    let input_ids = Tensor::new(tokens.get_ids(), &device)?.unsqueeze(0)?;
+
+    // Generate loop
+    let mut generated_tokens = Vec::new();
+    let mut generated_hidden_states = Vec::new();
+    let mut current_input = input_ids;
+    let mut all_tokens = tokens.get_ids().to_vec();
+    let mut pos = 0;
+
+    let temperature = 0.3f32;
+    let repetition_penalty = 1.2f32;
+
+    println!("Generating tokens (this may take a while)...");
+    for iter in 0..256 {
+        // Generate more tokens
+        let (logits, hidden_states) = qwen.forward(&current_input, pos)?;
+
+        // Debug: print hidden states info on first iteration
+        if iter == 0 {
+            let hs_shape = hidden_states.dims();
+            println!("DEBUG: Hidden states shape: {:?}", hs_shape);
+            let last_pos_hs = hidden_states.squeeze(0)?.get(hidden_states.dim(1)? - 1)?;
+            let hs_vec = last_pos_hs.to_vec1::<f32>()?;
+            println!(
+                "DEBUG: Hidden states at last position (first 10): {:?}",
+                &hs_vec[..10]
+            );
+            let min_val = hs_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_val = hs_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            println!(
+                "DEBUG: Hidden states range: [{:.4}, {:.4}]",
+                min_val, max_val
+            );
+        }
+
+        let mut logits = logits.squeeze(0)?.get(logits.dim(1)? - 1)?; // Last token logits
+
+        // Repetition penalty
+        if repetition_penalty != 1.0 {
+            let mut logits_vec = logits.to_vec1::<f32>()?;
+            for &t in all_tokens.iter() {
+                let t = t as usize;
+                if t < logits_vec.len() {
+                    if logits_vec[t] < 0.0 {
+                        logits_vec[t] *= repetition_penalty;
+                    } else {
+                        logits_vec[t] /= repetition_penalty;
+                    }
+                }
+            }
+            logits = Tensor::from_vec(logits_vec, logits.dims(), logits.device())?;
+        }
+
+        // Sampling
+        let next_token = if temperature > 0.0 {
+            let prs = candle_nn::ops::softmax_last_dim(&(logits / (temperature as f64))?)?;
+            let prs_vec = prs.to_vec1::<f32>()?;
+
+            // Simple sampling
+            let mut r = rand::random::<f32>();
+            let mut token = 0;
+            for (i, &p) in prs_vec.iter().enumerate() {
+                r -= p;
+                if r <= 0.0 {
+                    token = i as u32;
+                    break;
+                }
+            }
+            token
+        } else {
+            logits.argmax(0)?.to_scalar::<u32>()?
+        };
+
+        // Check for stop condition BEFORE collecting hidden state
+        // Python filters out EOS token hidden states
+        if next_token == 3 {
+            // [STOP] id is 3
+            break;
+        }
+
+        generated_tokens.push(next_token);
+        all_tokens.push(next_token);
+
+        // Collect hidden states only for non-EOS tokens
+        let last_hidden = hidden_states.squeeze(0)?.get(hidden_states.dim(1)? - 1)?;
+        generated_hidden_states.push(last_hidden);
+
+        current_input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
+        pos += current_input.dim(1)?;
+    }
+
+    // 5. Extract Audio Tokens / Hidden States
+    println!("Extracting audio codes...");
+    // We filter tokens that are in the audio range, and keep their corresponding hidden states.
+    // Or does the model only generate audio tokens after [START]?
+    // Soprano prompt format: [STOP][TEXT]...[START] -> Audio tokens follow.
+    // So all generated tokens should be considered audio tokens until stop?
+    // tts.py seems to take all hidden states from the response.
+    // But it does verify if they are valid?
+
+    // Let's assume all generated tokens are part of the audio sequence.
+
+    if generated_hidden_states.is_empty() {
+        anyhow::bail!("No tokens generated.");
+    }
+
+    let hidden_dim = generated_hidden_states[0].dim(0)?;
+    let hidden_tensor = Tensor::stack(&generated_hidden_states, 0)?; // (L, H)
+    let hidden_tensor = hidden_tensor.unsqueeze(0)?.transpose(1, 2)?.contiguous()?; // (1, H, L) as expected by Vocos (B, C, T)
+
+    // 6. Decode
+    println!("Decoding audio...");
+    // Vocos forward expects (B, C, T)
+    let mut audio_vec = vocos.forward(&hidden_tensor)?;
+
+    if audio_vec.is_empty() {
+        anyhow::bail!("Decoded audio is empty.");
+    }
+
+    // Python takes audio from the END: audio[-(lengths[i]*TOKEN_SIZE - TOKEN_SIZE):]
+    // This means we take (num_tokens - 1) * token_size samples from the end
+    let token_size = 2048;
+    let num_tokens = generated_hidden_states.len();
+    let expected_samples = if num_tokens > 1 {
+        (num_tokens - 1) * token_size
+    } else {
+        audio_vec.len()
+    };
+    let audio_vec = if audio_vec.len() > expected_samples {
+        // Take from the END of the audio, like Python does
+        audio_vec[audio_vec.len() - expected_samples..].to_vec()
+    } else {
+        audio_vec
+    };
+
+    let min_audio = audio_vec.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+    let max_audio = audio_vec.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    println!(
+        "Audio stats: len={}, min={:.4}, max={:.4}",
+        audio_vec.len(),
+        min_audio,
+        max_audio
+    );
+    println!("Generated tokens: {:?}", generated_tokens);
+
+    // 7. Save to WAV
+    println!("Saving to {}...", args.output);
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 32000, // Soprano uses 32kHz? tts.py: wavfile.write(out_path, 32000, ...)
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+
+    let mut writer = hound::WavWriter::create(&args.output, spec)?;
+    for sample in audio_vec {
+        writer.write_sample(sample)?;
+    }
+    writer.finalize()?;
+
+    println!("Done!");
+
+    Ok(())
+}
+</file>
+
+<file path="candle/src/qwen.rs">
+use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle_nn::{Activation, VarBuilder};
+use serde::Deserialize;
+use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Config {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub max_position_embeddings: usize,
+    pub sliding_window: Option<usize>,
+    pub max_window_layers: Option<usize>,
+    pub tie_word_embeddings: bool,
+    pub rope_theta: f64,
+    pub rms_norm_eps: f64,
+    pub use_sliding_window: bool,
+    pub hidden_act: Activation,
+    pub attention_bias: bool,
+}
+
+// Helpers from candle-transformers
+pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<candle_nn::Linear> {
+    let ws = vb.get((out_dim, in_dim), "weight")?;
+    Ok(candle_nn::Linear::new(ws, None))
+}
+
+pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<candle_nn::Linear> {
+    let ws = vb.get((out_dim, in_dim), "weight")?;
+    let bs = vb.get(out_dim, "bias")?;
+    Ok(candle_nn::Linear::new(ws, Some(bs)))
+}
+
+#[derive(Debug, Clone)]
+pub struct RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl RmsNorm {
+    pub fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        let weight = vb.get(size, "weight")?;
+        Ok(Self { weight, eps })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x_dtype = x.dtype();
+        let internal_dtype = match x_dtype {
+            DType::F16 | DType::BF16 => DType::F32,
+            d => d,
+        };
+        let hidden_size = x.dim(D::Minus1)?;
+        let x = x.to_dtype(internal_dtype)?;
+        let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / (hidden_size as f64))?;
+        let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
+        let x_normed = x_normed.to_dtype(x_dtype)?;
+        x_normed.broadcast_mul(&self.weight)
+    }
+}
+
+impl Module for RmsNorm {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward(x)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RotaryEmbedding {
+    sin: Tensor,
+    cos: Tensor,
+}
+
+impl RotaryEmbedding {
+    fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
+        let dim = cfg.hidden_size / cfg.num_attention_heads;
+        let max_seq_len = cfg.max_position_embeddings;
+        let inv_freq: Vec<_> = (0..dim)
+            .step_by(2)
+            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
+        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
+            .to_dtype(dtype)?
+            .reshape((max_seq_len, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+        Ok(Self {
+            sin: freqs.sin()?,
+            cos: freqs.cos()?,
+        })
+    }
+
+    fn apply_rotary_emb_qkv(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
+        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
+        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        Ok((q_embed, k_embed))
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(clippy::upper_case_acronyms)]
+struct MLP {
+    gate_proj: candle_nn::Linear,
+    up_proj: candle_nn::Linear,
+    down_proj: candle_nn::Linear,
+    act_fn: Activation,
+}
+
+impl MLP {
+    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let hidden_sz = cfg.hidden_size;
+        let intermediate_sz = cfg.intermediate_size;
+        let gate_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("gate_proj"))?;
+        let up_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("up_proj"))?;
+        let down_proj = linear_no_bias(intermediate_sz, hidden_sz, vb.pp("down_proj"))?;
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+            act_fn: cfg.hidden_act,
+        })
+    }
+}
+
+impl Module for MLP {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
+        let rhs = xs.apply(&self.up_proj)?;
+        (lhs * rhs)?.apply(&self.down_proj)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Attention {
+    q_proj: candle_nn::Linear,
+    k_proj: candle_nn::Linear,
+    v_proj: candle_nn::Linear,
+    o_proj: candle_nn::Linear,
+    q_norm: RmsNorm, // Qwen3: RMSNorm on Q after projection
+    k_norm: RmsNorm, // Qwen3: RMSNorm on K after projection
+    num_heads: usize,
+    num_kv_heads: usize,
+    num_kv_groups: usize,
+    head_dim: usize,
+    hidden_size: usize,
+    rotary_emb: Arc<RotaryEmbedding>,
+    kv_cache: Option<(Tensor, Tensor)>,
+}
+
+impl Attention {
+    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let hidden_sz = cfg.hidden_size;
+        let num_heads = cfg.num_attention_heads;
+        let num_kv_heads = cfg.num_key_value_heads;
+        let num_kv_groups = num_heads / num_kv_heads;
+        let head_dim = hidden_sz / num_heads;
+
+        let q_proj = if cfg.attention_bias {
+            linear(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?
+        } else {
+            linear_no_bias(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?
+        };
+
+        let k_proj = if cfg.attention_bias {
+            linear(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?
+        } else {
+            linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?
+        };
+
+        let v_proj = if cfg.attention_bias {
+            linear(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?
+        } else {
+            linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?
+        };
+
+        let o_proj = linear_no_bias(num_heads * head_dim, hidden_sz, vb.pp("o_proj"))?;
+
+        // Qwen3: RMSNorm on Q and K (applied per-head, so norm dim = head_dim)
+        let q_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
+        let k_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_heads,
+            num_kv_heads,
+            num_kv_groups,
+            head_dim,
+            hidden_size: hidden_sz,
+            rotary_emb,
+            kv_cache: None,
+        })
+    }
+
+    fn forward(
+        &mut self,
+        xs: &Tensor,
+        attention_mask: Option<&Tensor>,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+
+        let query_states = self.q_proj.forward(xs)?;
+        let key_states = self.k_proj.forward(xs)?;
+        let value_states = self.v_proj.forward(xs)?;
+
+        let query_states = query_states
+            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let key_states = key_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let value_states = value_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // Qwen3: Apply Q/K normalization (per-head, on last dim = head_dim)
+        let query_states = self.q_norm.forward(&query_states)?;
+        let key_states = self.k_norm.forward(&key_states)?;
+
+        let (query_states, key_states) =
+            self.rotary_emb
+                .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
+
+        let (key_states, value_states) = match &self.kv_cache {
+            None => (key_states, value_states),
+            Some((prev_k, prev_v)) => {
+                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
+                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
+                (key_states, value_states)
+            }
+        };
+        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+
+        // repeat kv
+        let key_states = if self.num_kv_groups > 1 {
+            let (b, n_kv, l, d) = key_states.dims4()?;
+            key_states
+                .unsqueeze(2)?
+                .repeat((1, 1, self.num_kv_groups, 1, 1))?
+                .reshape((b, n_kv * self.num_kv_groups, l, d))?
+        } else {
+            key_states
+        };
+        let value_states = if self.num_kv_groups > 1 {
+            let (b, n_kv, l, d) = value_states.dims4()?;
+            value_states
+                .unsqueeze(2)?
+                .repeat((1, 1, self.num_kv_groups, 1, 1))?
+                .reshape((b, n_kv * self.num_kv_groups, l, d))?
+        } else {
+            value_states
+        };
+
+        let attn_output = {
+            let scale = 1f64 / f64::sqrt(self.head_dim as f64);
+            let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+
+            let attn_weights = match attention_mask {
+                None => attn_weights,
+                Some(mask) => attn_weights.broadcast_add(mask)?,
+            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            attn_weights.matmul(&value_states)?
+        };
+        attn_output
+            .transpose(1, 2)?
+            .reshape((b_sz, q_len, self.hidden_size))?
+            .apply(&self.o_proj)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.kv_cache = None
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DecoderLayer {
+    self_attn: Attention,
+    mlp: MLP,
+    input_layernorm: RmsNorm,
+    post_attention_layernorm: RmsNorm,
+}
+
+impl DecoderLayer {
+    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let self_attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"))?;
+        let mlp = MLP::new(cfg, vb.pp("mlp"))?;
+        let input_layernorm =
+            RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let post_attention_layernorm = RmsNorm::new(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("post_attention_layernorm"),
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        })
+    }
+
+    fn forward(
+        &mut self,
+        xs: &Tensor,
+        attention_mask: Option<&Tensor>,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let residual = xs;
+        let xs = self.input_layernorm.forward(xs)?;
+        let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
+        let xs = (xs + residual)?;
+        let residual = &xs;
+        let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
+        residual + xs
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.self_attn.clear_kv_cache()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Model {
+    embed_tokens: candle_nn::Embedding,
+    layers: Vec<DecoderLayer>,
+    norm: RmsNorm,
+    sliding_window: usize,
+    device: Device,
+    dtype: DType,
+}
+
+impl Model {
+    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let vb_m = vb.pp("model");
+        let embed_tokens =
+            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        let vb_l = vb_m.pp("layers");
+        for layer_idx in 0..cfg.num_hidden_layers {
+            let layer = DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_idx))?;
+            layers.push(layer)
+        }
+        let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            sliding_window: cfg.sliding_window.unwrap_or(0),
+            device: vb.device().clone(),
+            dtype: vb.dtype(),
+        })
+    }
+
+    fn prepare_causal_attention_mask(
+        &self,
+        b_size: usize,
+        tgt_len: usize,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        // Simple causal mask
+        let mask: Vec<_> = (0..tgt_len)
+            .flat_map(|i| (0..tgt_len).map(move |j| if i < j { f32::NEG_INFINITY } else { 0. }))
+            .collect();
+        let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?;
+        let mask = if seqlen_offset > 0 {
+            let mask0 = Tensor::zeros((tgt_len, seqlen_offset), self.dtype, &self.device)?;
+            Tensor::cat(&[&mask0, &mask], D::Minus1)?
+        } else {
+            mask
+        };
+        mask.expand((b_size, 1, tgt_len, tgt_len + seqlen_offset))?
+            .to_dtype(self.dtype)
+    }
+
+    fn prepare_attention_mask(&self, attn_mask: &Tensor) -> Result<Tensor> {
+        let (b_sz, sql_len) = attn_mask.dims2()?;
+        let mut mask: Vec<Tensor> = vec![];
+        for b in 0..b_sz {
+            mask.push(attn_mask.i((b, ..))?.expand((1, 1, sql_len, sql_len))?);
+        }
+        let mask = Tensor::cat(&mask, 0)?;
+        let on_true = mask.zeros_like()?.to_dtype(self.dtype)?;
+        let on_false = Tensor::new(f32::NEG_INFINITY, &self.device)?
+            .broadcast_as(mask.shape())?
+            .to_dtype(self.dtype)?;
+        mask.where_cond(&on_true, &on_false)
+    }
+
+    pub fn forward(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        attn_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (b_size, seq_len) = input_ids.dims2()?;
+        let attention_mask: Option<Tensor> = match attn_mask {
+            Some(mask) => Some(self.prepare_attention_mask(mask)?),
+            None => {
+                if seq_len <= 1 {
+                    None
+                } else {
+                    Some(self.prepare_causal_attention_mask(b_size, seq_len, seqlen_offset)?)
+                }
+            }
+        };
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+        for layer in self.layers.iter_mut() {
+            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?
+        }
+        xs.apply(&self.norm)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.clear_kv_cache()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelForCausalLM {
+    base_model: Model,
+    lm_head: candle_nn::Linear,
+}
+
+impl ModelForCausalLM {
+    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let base_model = Model::new(cfg, vb.clone())?;
+        let lm_head = if vb.contains_tensor("lm_head.weight") {
+            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+        } else {
+            candle_nn::Linear::new(base_model.embed_tokens.embeddings().clone(), None)
+        };
+        Ok(Self {
+            base_model,
+            lm_head,
+        })
+    }
+
+    // Modified forward to return both logits and hidden states
+    pub fn forward(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (_b_size, seq_len) = input_ids.dims2()?;
+        let hidden_states = self.base_model.forward(input_ids, seqlen_offset, None)?;
+
+        let logits = hidden_states
+            .narrow(1, seq_len - 1, 1)?
+            .apply(&self.lm_head)?;
+
+        Ok((logits, hidden_states))
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.base_model.clear_kv_cache()
+    }
+}
+</file>
+
+<file path="candle/src/vocos.rs">
+use candle_core::{DType, Device, Result, Tensor};
+use candle_nn::{Conv1d, Conv1dConfig, LayerNorm, Linear, Module, VarBuilder};
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct VocosConfig {
+    pub num_input_channels: usize,
+    pub decoder_num_layers: usize,
+    pub decoder_dim: usize,
+    pub decoder_intermediate_dim: usize,
+    pub hop_length: usize,
+    pub n_fft: usize,
+    pub upscale: usize,
+    pub dw_kernel: usize,
+}
+
+struct ConvNeXtBlock {
+    dwconv: Conv1d,
+    norm: LayerNorm,
+    pwconv1: Linear,
+    pwconv2: Linear,
+    gamma: Option<Tensor>,
+}
+
+impl ConvNeXtBlock {
+    fn new(
+        dim: usize,
+        intermediate_dim: usize,
+        layer_scale_init_value: Option<f64>,
+        dw_kernel_size: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let dwconv_cfg = Conv1dConfig {
+            padding: dw_kernel_size / 2,
+            groups: dim,
+            ..Default::default()
+        };
+        let dwconv = candle_nn::conv1d(dim, dim, dw_kernel_size, dwconv_cfg, vb.pp("dwconv"))?;
+        let norm = candle_nn::layer_norm(dim, 1e-6, vb.pp("norm"))?;
+        let pwconv1 = candle_nn::linear(dim, intermediate_dim, vb.pp("pwconv1"))?;
+        let pwconv2 = candle_nn::linear(intermediate_dim, dim, vb.pp("pwconv2"))?;
+
+        let gamma = if let Some(init_value) = layer_scale_init_value {
+            if init_value > 0.0 {
+                // In PyTorch: nn.Parameter(layer_scale_init_value * torch.ones(dim), requires_grad=True)
+                // In safetensors, this parameter is stored as "gamma".
+                // If it exists in the weights, we load it.
+                // However, the logic in python checks init_value > 0 to decide whether to create it.
+                // We should check if "gamma" exists in vb.
+                if vb.contains_tensor("gamma") {
+                    Some(vb.get(dim, "gamma")?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            // If layer_scale_init_value is None, check if gamma exists anyway (maybe passed differently or default behaviour)
+            if vb.contains_tensor("gamma") {
+                Some(vb.get(dim, "gamma")?)
+            } else {
+                None
+            }
+        };
+
+        Ok(Self {
+            dwconv,
+            norm,
+            pwconv1,
+            pwconv2,
+            gamma,
+        })
+    }
+}
+
+impl Module for ConvNeXtBlock {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let residual = x.clone();
+        let x = self.dwconv.forward(x)?;
+        // x: (B, C, T) -> (B, T, C)
+        let x = x.transpose(1, 2)?;
+        let x = self.norm.forward(&x)?;
+        let x = self.pwconv1.forward(&x)?;
+        let x = x.gelu()?;
+        let x = self.pwconv2.forward(&x)?;
+
+        let x = if let Some(gamma) = &self.gamma {
+            // gamma is (C), x is (B, T, C)
+            // broadcasting happens on last dim automatically?
+            // Candle broadcasting: if shapes match from right.
+            // gamma: (C), x: (B, T, C). Yes.
+            x.broadcast_mul(gamma)?
+        } else {
+            x
+        };
+
+        let x = x.transpose(1, 2)?; // (B, C, T)
+
+        // Residual connection
+        residual + x
+    }
+}
+
+struct VocosBackbone {
+    embed: Conv1d,
+    norm: LayerNorm,
+    convnext: Vec<ConvNeXtBlock>,
+    final_layer_norm: LayerNorm,
+}
+
+impl VocosBackbone {
+    fn new(cfg: &VocosConfig, vb: VarBuilder) -> Result<Self> {
+        let input_channels = cfg.num_input_channels;
+        let dim = cfg.decoder_dim;
+        let intermediate_dim = cfg.decoder_intermediate_dim;
+        let num_layers = cfg.decoder_num_layers;
+        let dw_kernel_size = cfg.dw_kernel;
+        let input_kernel_size = dw_kernel_size;
+
+        // Python:
+        // layer_scale_init_value or 1 / num_layers**0.5
+        let layer_scale_init_value = 1.0 / (num_layers as f64).sqrt();
+
+        let embed_cfg = Conv1dConfig {
+            padding: input_kernel_size / 2,
+            ..Default::default()
+        };
+        let embed = candle_nn::conv1d(
+            input_channels,
+            dim,
+            input_kernel_size,
+            embed_cfg,
+            vb.pp("embed"),
+        )?;
+        let norm = candle_nn::layer_norm(dim, 1e-6, vb.pp("norm"))?;
+
+        let mut convnext = Vec::new();
+        let vb_conv = vb.pp("convnext");
+        for i in 0..num_layers {
+            let block = ConvNeXtBlock::new(
+                dim,
+                intermediate_dim,
+                Some(layer_scale_init_value),
+                dw_kernel_size,
+                vb_conv.pp(i),
+            )?;
+            convnext.push(block);
+        }
+
+        let final_layer_norm = candle_nn::layer_norm(dim, 1e-6, vb.pp("final_layer_norm"))?;
+
+        Ok(Self {
+            embed,
+            norm,
+            convnext,
+            final_layer_norm,
+        })
+    }
+}
+
+impl Module for VocosBackbone {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut x = self.embed.forward(x)?;
+        x = x.transpose(1, 2)?;
+        x = self.norm.forward(&x)?;
+        x = x.transpose(1, 2)?;
+
+        for block in &self.convnext {
+            x = block.forward(&x)?;
+        }
+
+        x = x.transpose(1, 2)?;
+        x = self.final_layer_norm.forward(&x)?;
+        x = x.transpose(1, 2)?;
+        Ok(x)
+    }
+}
+
+struct ISTFTHead {
+    out: Linear,
+    n_fft: usize,
+    hop_length: usize,
+    win_length: usize,
+    padding: String,
+    window: Tensor,
+}
+
+impl ISTFTHead {
+    fn new(cfg: &VocosConfig, vb: VarBuilder) -> Result<Self> {
+        let dim = cfg.decoder_dim;
+        let n_fft = cfg.n_fft;
+        let hop_length = cfg.hop_length;
+        let win_length = n_fft; // In Python code: win_length=n_fft
+        let padding = "center".to_string(); // Python default is "center"
+
+        let out_dim = n_fft + 2;
+        let out = candle_nn::linear(dim, out_dim, vb.pp("out"))?;
+
+        // Window: torch.hann_window(win_length)
+        // We need to generate hann window.
+        // Formula: 0.5 * (1 - cos(2 * pi * n / (M - 1)))
+        // 0 <= n <= M-1
+        let window = hann_window(win_length, vb.device())?;
+
+        Ok(Self {
+            out,
+            n_fft,
+            hop_length,
+            win_length,
+            padding,
+            window,
+        })
+    }
+
+    fn istft(&self, real: &Tensor, imag: &Tensor) -> Result<Tensor> {
+        // real, imag: (B, N, T) where N = n_fft/2 + 1 usually for rfft, but here input is full spectrum?
+        // Wait, Python code says:
+        // ifft = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
+        // spec is complex.
+
+        // In python:
+        // x = self.out(x.transpose(1,2)).transpose(1, 2)
+        // mag, p = x.chunk(2, dim=1)
+        // ...
+        // S = mag * (x + 1j * y) -> S shape (B, N_FFT/2 + 1, T) usually?
+
+        // In Python ISTFTHead:
+        // out_dim = n_fft + 2.
+        // mag, p = x.chunk(2, dim=1) -> each has (n_fft/2 + 1) channels?
+        // No, n_fft + 2 split by 2 is n_fft/2 + 1.
+        // So S has n_fft/2 + 1 frequency bins.
+        // irfft expects this for real output.
+
+        // Candle doesn't have irfft easily accessible or "fold".
+        // We need to implement irfft using inverse dft if possible, or simple IDFT if N is small (2048 is not small).
+        // BUT candle-core might not have FFT operations exposed.
+        // I need to check if I can use a crate or if I have to implement it.
+        // Since I cannot easily add new crates that are not in the environment (unless I can compile them),
+        // I should check what's available. `candle-core` doesn't seem to have FFT.
+        // Actually, maybe I can use `realfft` crate? Or is it pure rust?
+        // Wait, I am allowed to add dependencies in Cargo.toml.
+        // But `candle` is GPU accelerated. If I use CPU FFT, I need to move data back and forth.
+        // If I run on CPU, it's fine.
+
+        // Let's assume we can use a rust FFT library. `rustfft`.
+        // But we need to handle batching.
+
+        // Alternative: Implementing naive IDFT as matrix multiplication?
+        // O(N^2). 2048^2 = 4M ops per column. Might be slow but works on GPU if implemented as matmul.
+        // We need IDFT matrix.
+        // IDFT(k, n) = 1/N * exp(i * 2*pi * k * n / N)
+        // Since we are doing irfft (inverse real fft), the input is half spectrum.
+        // Reconstructing full spectrum and then IDFT?
+
+        // Constructing IDFT matrix:
+        // W[n, k] = exp(i * 2*pi * n * k / N)
+        // We want x[n] = 1/N * sum_k X[k] * W[n, k]
+        // Since output is real, we can optimize.
+
+        // Let's implement it using matrix multiplication for now.
+        // It might be memory intensive if batch size or sequence length is large.
+        // B, F, T.
+        // We operate on F dim.
+        // We need (N, F) matrix.
+        // Output (B, N, T).
+
+        // Steps:
+        // 1. Reconstruct full complex spectrum from half spectrum (S).
+        //    S: (B, N_freq, T). N_freq = n_fft/2 + 1.
+        //    Full spectrum S_full: (B, n_fft, T).
+        //    S_full[0] = S[0]
+        //    S_full[k] = S[k] for 1 <= k < N/2
+        //    S_full[N/2] = S[N/2] (Nyquist)
+        //    S_full[N-k] = conj(S[k])
+
+        // 2. IDFT via matrix mult.
+        //    x = (IDFT_matrix @ S_full).real?
+        //    Actually, we can do it with real arithmetic to avoid complex numbers if Candle doesn't support them well.
+        //    x[n] = 1/N * ( X[0] + X[N/2]*cos(pi*n) + 2*sum_{k=1}^{N/2-1} (Re[X[k]]*cos(2pi*k*n/N) - Im[X[k]]*sin(2pi*k*n/N)) )
+
+        //    So we can create a large weight matrix for this transformation.
+        //    Input: Real and Imag parts of S (freqs 0 to N/2).
+        //    Input dim: 2 * (N/2 + 1) = N + 2.
+        //    Output dim: N.
+        //    We can precompute a linear layer that maps (Re, Im) -> Time domain signal window.
+
+        //    Wait, this is exactly what `torch.fft.irfft` does efficiently.
+        //    As a linear operation, it is just a matrix multiplication.
+        //    Weight matrix W of shape (N, N+2).
+        //    We can precompute this W.
+
+        //    This avoids using external FFT libraries and works on GPU with Candle!
+
+        //    Let's precompute the IDFT matrix in `new`.
+
+        let device = real.device();
+        let (b_size, _, t_size) = real.dims3()?;
+
+        // Combine real and imag into one tensor for matmul
+        // We expect real: (B, F, T), imag: (B, F, T) where F = n_fft/2 + 1
+        // We want input (B, T, 2*F) -> Output (B, T, n_fft)
+
+        let real_t = real.transpose(1, 2)?; // (B, T, F)
+        let imag_t = imag.transpose(1, 2)?; // (B, T, F)
+
+        let input = Tensor::cat(&[&real_t, &imag_t], 2)?; // (B, T, 2F)
+
+        // We need a stored IDFT matrix.
+        // It should be registered as a buffer or just a tensor in the struct.
+        // Let's assume we have `self.idft_matrix` of shape (2F, n_fft).
+        // Then input @ idft_matrix -> (B, T, n_fft).
+
+        // Wait, typical Linear is x @ w.t() + b.
+        // So if idft_matrix is (n_fft, 2F), we can use linear or matmul.
+
+        // Need to define idft_matrix in struct and `new`.
+
+        // 3. Overlap-Add (Fold).
+        //    Candle doesn't have `fold`.
+        //    We have frames (B, T, n_fft).
+        //    We need to overlap-add them.
+        //    Output length L approx T * hop_length.
+        //    We can manually implement this by creating a large zero tensor and adding slices.
+        //    But modifying tensors in place is tricky in Candle (immutable mostly?).
+        //    Actually, we can use `scatter_add` if available, or just a loop if T is not too huge.
+        //    Or we can reshape and sum if we can construct the structure correctly.
+
+        //    Let's look at `col2im` or similar? No.
+
+        //    Looping over T frames might be slow in Rust/Candle graph, but maybe okay for inference.
+        //    However, T can be ~100-1000.
+        //    Can we vectorize?
+
+        //    We can use the "reshape and sum" trick for constant overlap-add.
+        //    If `n_fft` is multiple of `hop_length` (e.g. 2048 and 512 -> 4x overlap).
+        //    We can arrange the data into 4 streams and sum them.
+        //
+        //    Frames: 0, 1, 2, 3, 4, 5...
+        //    Stream 0: Frame 0, 4, 8... (padded with zeros in between?)
+        //    This seems complicated to implement generally.
+
+        //    Let's stick to a loop for now, or see if we can optimize.
+        //    Since we are generating audio, T is length of tokens.
+        //    For 10 seconds of audio, T ~ 10s * 24000sr / 512hop ~ 468 frames.
+        //    Looping 500 times is fine in Rust.
+
+        Err(candle_core::Error::Msg("Not implemented".into()))
+    }
+}
+
+fn hann_window(size: usize, device: &Device) -> Result<Tensor> {
+    let mut data = Vec::with_capacity(size);
+    for i in 0..size {
+        let n = i as f64;
+        let m = size as f64;
+        let val = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * n / m).cos()); // Standard Hann window
+                                                                            // Note: PyTorch hann_window might be periodic=True by default which uses M instead of M-1?
+                                                                            // torch.hann_window(window_length, periodic=True, *)
+                                                                            // If periodic=True (default), formula uses N. If periodic=False, uses N-1.
+                                                                            // STFT usually uses periodic window.
+        data.push(val as f32);
+    }
+    Tensor::from_vec(data, (size,), device)
+}
+
+fn make_idft_matrix(n_fft: usize, device: &Device) -> Result<Tensor> {
+    // Construct matrix M of shape (2*(n_fft/2+1), n_fft)
+    // such that [Re(S); Im(S)] @ M = x (time domain)
+    // x[n] = 1/N * sum_{k=0}^{N-1} X[k] exp(i 2pi k n / N)
+    // X[k] comes from Re, Im.
+    // X[k] = Re[k] + i Im[k]
+    // X[N-k] = Re[k] - i Im[k]
+
+    // x[n] = 1/N * [ X[0] + X[N/2]cos(pi n) + sum_{k=1}^{N/2-1} (Re[k] + i Im[k])(cos(...) + i sin(...)) + (Re[k] - i Im[k])(cos(...) - i sin(...)) ]
+    // ... expansion ...
+    // x[n] = 1/N * [ Re[0] + Re[N/2]cos(pi n) + 2 sum_{k=1}^{N/2-1} (Re[k]cos(2pi k n / N) - Im[k]sin(2pi k n / N)) ]
+
+    // So coeffs for Re[0]: 1/N
+    // Coeffs for Re[N/2]: 1/N * cos(pi n)
+    // Coeffs for Re[k]: 2/N * cos(2pi k n / N)
+    // Coeffs for Im[k]: -2/N * sin(2pi k n / N)
+    // Coeffs for Im[0]: 0
+    // Coeffs for Im[N/2]: 0
+
+    let num_freqs = n_fft / 2 + 1;
+    let input_dim = 2 * num_freqs;
+    let mut matrix = vec![0.0f32; input_dim * n_fft]; // Row-major: rows are input channels, cols are output time
+
+    let scale = 1.0 / n_fft as f32;
+
+    for n in 0..n_fft {
+        for k in 0..num_freqs {
+            // Index in flat vector: row * n_fft + col
+            // Row mapping: 0..num_freqs are Real, num_freqs..2*num_freqs are Imag
+
+            let arg = 2.0 * std::f64::consts::PI * (k as f64) * (n as f64) / (n_fft as f64);
+            let cos_v = arg.cos() as f32;
+            let sin_v = arg.sin() as f32;
+
+            let re_idx = k;
+            let im_idx = k + num_freqs;
+
+            let factor = if k == 0 || k == num_freqs - 1 {
+                1.0
+            } else {
+                2.0
+            };
+            // Wait, nyquist index is n_fft/2. num_freqs = n_fft/2 + 1. So last index is n_fft/2.
+
+            // For Re[k]
+            matrix[re_idx * n_fft + n] = scale * factor * cos_v;
+
+            // For Im[k]
+            if k > 0 && k < num_freqs - 1 {
+                matrix[im_idx * n_fft + n] = -scale * factor * sin_v;
+            } else {
+                matrix[im_idx * n_fft + n] = 0.0;
+            }
+        }
+    }
+
+    // Transpose to (n_fft, input_dim) for linear layer?
+    // Linear: x @ w.t(). If we want x @ M, then w = M.t().
+    // Let's keep it as (input_dim, n_fft) and use matmul explicitly or transpose it.
+    // Candle Linear uses weight shape (out_dim, in_dim).
+    // Here out_dim = n_fft, in_dim = 2*num_freqs.
+    // So we need (n_fft, 2*num_freqs).
+    // Our `matrix` vector is currently (in_dim, out_dim) if we view it as rows=in.
+    // Let's create tensor (in_dim, out_dim) and transpose.
+
+    let tensor = Tensor::from_vec(matrix, (input_dim, n_fft), device)?;
+    Ok(tensor) // (input_dim, n_fft)
+}
+
+pub struct SopranoDecoder {
+    decoder: VocosBackbone,
+    head: ISTFTHead,
+    upscale: usize,
+    idft_matrix: Tensor,
+}
+
+impl SopranoDecoder {
+    pub fn new(cfg: &VocosConfig, vb: VarBuilder) -> Result<Self> {
+        let decoder = VocosBackbone::new(cfg, vb.pp("decoder"))?;
+        let head = ISTFTHead::new(cfg, vb.pp("head"))?;
+        let upscale = cfg.upscale;
+        let idft_matrix = make_idft_matrix(cfg.n_fft, vb.device())?;
+
+        Ok(Self {
+            decoder,
+            head,
+            upscale,
+            idft_matrix,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Vec<f32>> {
+        // x: (B, C, L)
+        let (b, c, t) = x.dims3()?;
+
+        // Interpolate
+        let x_interp = interpolate_linear(x, self.upscale)?;
+
+        let x_decoded = self.decoder.forward(&x_interp)?;
+
+        // Head
+        let x_head = self.head.out.forward(&x_decoded.transpose(1, 2)?)?; // (B, T, out_dim)
+        let x_head = x_head.transpose(1, 2)?; // (B, out_dim, T)
+
+        let chunks = x_head.chunk(2, 1)?;
+        let mag = &chunks[0];
+        let p = &chunks[1];
+        let mag = mag.exp()?;
+        let mag = mag.clamp(f32::NEG_INFINITY, 100.0)?;
+
+        let cos_p = p.cos()?;
+        let sin_p = p.sin()?;
+
+        let re = (mag.clone() * cos_p)?;
+        let im = (mag * sin_p)?;
+
+        // ISTFT
+        // re, im: (B, F, T)
+        let (_, f, t_out) = re.dims3()?;
+        let re_t = re.transpose(1, 2)?; // (B, T, F)
+        let im_t = im.transpose(1, 2)?;
+
+        let spectral = Tensor::cat(&[&re_t, &im_t], 2)?.contiguous()?; // (B, T, 2F)
+
+        // Apply IDFT matrix
+        // spectral: (B, T, 2F)
+        // idft_matrix: (2F, n_fft)
+        // output: spectral @ idft_matrix -> (B, T, n_fft)
+        let (b_idft, t_idft, f2_idft) = spectral.dims3()?;
+        let spectral_2d = spectral.reshape((b_idft * t_idft, f2_idft))?;
+        let ifft_2d = spectral_2d.matmul(&self.idft_matrix)?;
+        let ifft = ifft_2d.reshape((b_idft, t_idft, self.head.n_fft))?;
+
+        // Apply window
+        // window: (n_fft)
+        let window = &self.head.window;
+        let ifft = ifft.broadcast_mul(window)?; // (B, T, n_fft)
+
+        // Overlap Add
+        // We need to fold.
+        // Flatten ifft to (B, T*n_fft).
+        // Accumulate into output buffer.
+
+        // Since B=1 usually for TTS, let's optimize for that or just loop.
+        // We return Vec<f32> eventually.
+        // Let's move to CPU and do overlap-add in Rust Vec?
+        // It might be faster than trying to do it in Candle if ops are missing.
+
+        let ifft_vec = ifft.flatten_all()?.to_vec1::<f32>()?;
+        let hop_length = self.head.hop_length;
+        let win_length = self.head.win_length;
+        let n_frames = t_out;
+
+        // Calculate output size
+        let output_size = (n_frames - 1) * hop_length + win_length;
+
+        // For "center" padding (Python default), pad = n_fft // 2
+        // For "same" padding, pad = (win_length - hop_length) // 2
+        let pad = if self.head.padding == "center" {
+            self.head.n_fft / 2
+        } else {
+            (win_length - hop_length) / 2
+        };
+
+        let mut output_audio = vec![0.0f32; output_size];
+        let mut envelope = vec![0.0f32; output_size];
+        let window_vec = window.to_vec1::<f32>()?;
+        let window_sq_vec: Vec<f32> = window_vec.iter().map(|x| x * x).collect();
+
+        for i in 0..n_frames {
+            let start = i * hop_length;
+            let frame_start = i * win_length; // in ifft_vec
+
+            for j in 0..win_length {
+                if start + j < output_size {
+                    output_audio[start + j] += ifft_vec[frame_start + j];
+                    envelope[start + j] += window_sq_vec[j];
+                }
+            }
+        }
+
+        // Normalize and trim padding
+        let end_idx = if output_size > pad {
+            output_size - pad
+        } else {
+            output_size
+        };
+        let start_idx = pad.min(end_idx);
+        let mut result = Vec::with_capacity(end_idx - start_idx);
+
+        for i in start_idx..end_idx {
+            if envelope[i] > 1e-11 {
+                result.push(output_audio[i] / envelope[i]);
+            } else {
+                result.push(output_audio[i]);
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+fn interpolate_linear(x: &Tensor, scale_factor: usize) -> Result<Tensor> {
+    // x: (B, C, T)
+    let (b, c, t) = x.dims3()?;
+    let new_t = scale_factor * (t - 1) + 1;
+
+    // We can use conv1d_transpose
+    // Weight should be fixed to perform linear interpolation.
+    // Kernel size = 2 * scale_factor - 1 ?
+    // Stride = scale_factor.
+    // Padding = scale_factor - 1.
+    // Groups = C.
+
+    // Actually, simpler approach given we don't need gradients:
+    // Create new tensor of size (B, C, new_t)
+    // Fill it.
+    // Since we are in Candle, we want to avoid loops over tensor elements.
+
+    // Let's try to use `upsample_nearest` followed by smoothing? No.
+
+    // Use `gather`.
+    // Generate indices.
+    // For each output index i:
+    // input position p = i / scale_factor
+    // alpha = i % scale_factor / scale_factor
+    // val = x[floor(p)] * (1-alpha) + x[ceil(p)] * alpha
+
+    // Construct index tensors.
+    let device = x.device();
+    let mut indices_floor = Vec::with_capacity(new_t);
+    let mut indices_ceil = Vec::with_capacity(new_t);
+    let mut alphas = Vec::with_capacity(new_t);
+
+    for i in 0..new_t {
+        let p = i as f32 / scale_factor as f32;
+        let p_floor = p.floor() as i64;
+        let p_ceil = p.ceil() as i64;
+
+        // Clamp indices to [0, t-1]
+        let p_floor = p_floor.clamp(0, (t - 1) as i64);
+        let p_ceil = p_ceil.clamp(0, (t - 1) as i64);
+
+        let alpha = p - p.floor();
+
+        indices_floor.push(p_floor);
+        indices_ceil.push(p_ceil);
+        alphas.push(alpha);
+    }
+
+    let idx_floor = Tensor::from_vec(indices_floor, (new_t,), device)?;
+    let idx_ceil = Tensor::from_vec(indices_ceil, (new_t,), device)?;
+    let alpha = Tensor::from_vec(alphas, (1, 1, new_t), device)?;
+
+    // Gather on dim 2
+    let x_floor = x.index_select(&idx_floor, 2)?;
+    let x_ceil = x.index_select(&idx_ceil, 2)?;
+
+    let one_minus_alpha = (1.0 - alpha.clone())?;
+
+    let res = (x_floor.broadcast_mul(&one_minus_alpha)? + x_ceil.broadcast_mul(&alpha)?)?;
+
+    Ok(res)
+}
 </file>
 
 <file path="soprano/backends/lmdeploy.py">
