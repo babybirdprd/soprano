@@ -124,27 +124,9 @@ fn main() -> Result<()> {
     let repetition_penalty = 1.2f32;
 
     println!("Generating tokens (this may take a while)...");
-    for iter in 0..256 {
+    for _iter in 0..256 {
         // Generate more tokens
         let (logits, hidden_states) = qwen.forward(&current_input, pos)?;
-
-        // Debug: print hidden states info on first iteration
-        if iter == 0 {
-            let hs_shape = hidden_states.dims();
-            println!("DEBUG: Hidden states shape: {:?}", hs_shape);
-            let last_pos_hs = hidden_states.squeeze(0)?.get(hidden_states.dim(1)? - 1)?;
-            let hs_vec = last_pos_hs.to_vec1::<f32>()?;
-            println!(
-                "DEBUG: Hidden states at last position (first 10): {:?}",
-                &hs_vec[..10]
-            );
-            let min_val = hs_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max_val = hs_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            println!(
-                "DEBUG: Hidden states range: [{:.4}, {:.4}]",
-                min_val, max_val
-            );
-        }
 
         let mut logits = logits.squeeze(0)?.get(logits.dim(1)? - 1)?; // Last token logits
 
@@ -169,9 +151,34 @@ fn main() -> Result<()> {
         // Sampling
         let next_token = if temperature > 0.0 {
             let prs = candle_nn::ops::softmax_last_dim(&(logits / (temperature as f64))?)?;
-            let prs_vec = prs.to_vec1::<f32>()?;
+            let mut prs_vec = prs.to_vec1::<f32>()?;
 
-            // Simple sampling
+            // Top-p sampling
+            let top_p = 0.95f32;
+            let mut sorted_prs: Vec<(usize, f32)> =
+                prs_vec.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+            sorted_prs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+            let mut cumulative_p = 0.0;
+            let mut cutoff_idx = sorted_prs.len();
+            for (i, (_, p)) in sorted_prs.iter().enumerate() {
+                cumulative_p += p;
+                if cumulative_p > top_p {
+                    cutoff_idx = i + 1;
+                    break;
+                }
+            }
+            // Zero out probabilities for tokens not in top_p
+            for i in cutoff_idx..sorted_prs.len() {
+                prs_vec[sorted_prs[i].0] = 0.0;
+            }
+            // Re-normalize
+            let sum: f32 = prs_vec.iter().sum();
+            for p in prs_vec.iter_mut() {
+                *p /= sum;
+            }
+
+            // Simple sampling from filtered distribution
             let mut r = rand::random::<f32>();
             let mut token = 0;
             for (i, &p) in prs_vec.iter().enumerate() {
@@ -218,7 +225,7 @@ fn main() -> Result<()> {
         anyhow::bail!("No tokens generated.");
     }
 
-    let hidden_dim = generated_hidden_states[0].dim(0)?;
+    let _hidden_dim = generated_hidden_states[0].dim(0)?;
     let hidden_tensor = Tensor::stack(&generated_hidden_states, 0)?; // (L, H)
     let hidden_tensor = hidden_tensor.unsqueeze(0)?.transpose(1, 2)?.contiguous()?; // (1, H, L) as expected by Vocos (B, C, T)
 
