@@ -2381,6 +2381,7 @@ dependencies = [
  "hound",
  "rand 0.8.5",
  "realfft",
+ "rustfft",
  "serde",
  "serde_json",
  "tokenizers",

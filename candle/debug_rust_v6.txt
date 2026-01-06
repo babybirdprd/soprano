@@ -1,0 +1,107 @@
+   Compiling soprano-candle v0.1.0 (D:\soprano\candle)
+warning: unused variable: `b`
+   --> src\vocos.rs:454:10
+    |
+454 |     let (b, c, t) = x.dims3()?;
+    |          ^ help: if this is intentional, prefix it with an underscore: `_b`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `c`
+   --> src\vocos.rs:454:13
+    |
+454 |     let (b, c, t) = x.dims3()?;
+    |             ^ help: if this is intentional, prefix it with an underscore: `_c`
+
+warning: unused variable: `hidden_dim`
+   --> src\main.rs:221:9
+    |
+221 |     let hidden_dim = generated_hidden_states[0].dim(0)?;
+    |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_hidden_dim`
+
+warning: method `clear_kv_cache` is never used
+   --> src\qwen.rs:287:8
+    |
+161 | impl Attention {
+    | -------------- method in this implementation
+...
+287 |     fn clear_kv_cache(&mut self) {
+    |        ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `clear_kv_cache` is never used
+   --> src\qwen.rs:334:8
+    |
+300 | impl DecoderLayer {
+    | ----------------- method in this implementation
+...
+334 |     fn clear_kv_cache(&mut self) {
+    |        ^^^^^^^^^^^^^^
+
+warning: field `sliding_window` is never read
+   --> src\qwen.rs:344:5
+    |
+340 | pub struct Model {
+    |            ----- field in this struct
+...
+344 |     sliding_window: usize,
+    |     ^^^^^^^^^^^^^^
+    |
+    = note: `Model` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: method `clear_kv_cache` is never used
+   --> src\qwen.rs:431:12
+    |
+349 | impl Model {
+    | ---------- method in this implementation
+...
+431 |     pub fn clear_kv_cache(&mut self) {
+    |            ^^^^^^^^^^^^^^
+
+warning: method `clear_kv_cache` is never used
+   --> src\qwen.rs:474:12
+    |
+444 | impl ModelForCausalLM {
+    | --------------------- method in this implementation
+...
+474 |     pub fn clear_kv_cache(&mut self) {
+    |            ^^^^^^^^^^^^^^
+
+warning: `soprano-candle` (bin "soprano-candle") generated 8 warnings
+    Finished `release` profile [optimized] target(s) in 34.69s
+     Running `target\release\soprano-candle.exe --prompt "hello world!"`
+Using device: Cpu
+Loading tokenizer...
+Loading Qwen model...
+Loading Vocos model...
+Generating tokens...
+Prompt tokens: [3, 1, 8077, 8070, 8045, 8004, 8053, 8076, 8139, 8005, 2]
+Generating tokens (this may take a while)...
+DEBUG: Hidden states shape: [1, 11, 512]
+DEBUG: Hidden states at last position (first 10): [-0.23600166, 0.95291877, -0.27345368, -0.38878685, -0.4340747, -1.2991865, 0.5617781, 0.6938202, -0.03743372, -0.5303086]
+DEBUG: Hidden states range: [-8.0287, 9.2031]
+Extracting audio codes...
+Decoding audio...
+DEBUG_RUST_INPUT shape: [1, 512, 17]
+DEBUG_RUST_INPUT tail: [0.99320394, -0.05553239, 0.5636833, 0.64090693, 0.33390197, 0.58061016, 1.2196292, 0.96391547, 0.09715326, 0.35566193]
+DEBUG_RUST_INTERP shape: [1, 512, 65]
+DEBUG_RUST_INTERP tail: [1.027844, 0.96391547, 0.7472249, 0.5305344, 0.31384382, 0.09715326, 0.16178043, 0.22640759, 0.2910348, 0.35566193]
+DEBUG_RUST_BACKBONE shape: [1, 512, 65]
+DEBUG_RUST_BACKBONE head: [0.06666672, -1.083622, 0.054217234, -0.33854818, -1.635999, -0.5422554, -1.1976004, -0.0013405383, -0.17120253, -0.2255589]
+DEBUG_RUST_BACKBONE tail: [0.41640988, -0.79083174, 0.2728716, -0.12940338, -0.81937146, 0.31471822, 0.070707835, -1.353805, -1.4608696, -0.04837361]
+DEBUG_RUST_MAG shape: [1, 1025, 65]
+DEBUG_RUST_MAG head: [1.1555829, 1.0259286, 1.3322762, 1.0978612, 1.2643299, 1.2951806, 1.1709218, 0.62797374, 0.75611776, 0.6944896]
+DEBUG_RUST_MAG tail: [0.5011652, 1.3298794, 1.7410158, 1.6540425, 1.2262144, 0.834729, 0.782109, 0.903836, 0.82488674, 0.91859955]
+DEBUG_RUST_PHASE shape: [1, 1025, 65]
+DEBUG_RUST_PHASE head: [0.16976885, 0.30845016, 0.6115908, 0.1777435, 0.49398625, 0.16053689, 0.05569385, 0.104738444, -0.03892693, 1.1960627]
+DEBUG_RUST_PHASE tail: [0.56932414, 0.13838403, -0.23931316, -0.2158681, -0.029815381, 0.060216293, 0.5399604, 0.01815364, -0.31466982, -0.28487852]
+DEBUG_RUST_IRFFT_FRAME0_SCALED head: [0.00013147324, 5.1337054e-5, 0.00016902477, 0.000101167476, 0.00016836538, 0.0002504952, 0.00025181632, 0.00014958369, 0.00014402923, 0.00010456201]
+DEBUG_RUST_IRFFT_FRAME0_SCALED tail: [0.0001695084, 0.00015812422, 0.00015940043, 0.00018040572, 5.7259e-5, 0.00010186564, 0.00017206173, 2.3047418e-5, 4.4437344e-5, 8.666032e-5]
+DEBUG_RUST_FINAL_AUDIO shape: [32768]
+DEBUG_RUST_FINAL_AUDIO head: [-0.00012062506, -0.00010877679, -0.0001308408, -0.00010755815, -0.00012601368, -0.000111082634, -0.00012340292, -0.00010030161, -0.0001157374, -0.00010379529]
+DEBUG_RUST_FINAL_AUDIO tail: [-0.0001434832, -8.930114e-5, -0.00011018171, -0.00021890539, -0.00030318246, -0.00028093474, -0.0003224223, -0.00030011826, -0.00026515327, -0.0001558558]
+Audio stats: len=32768, min=-0.3784, max=0.5319
+Generated tokens: [7392, 4619, 7396, 3456, 7581, 5734, 5042, 3445, 292, 308, 5436, 7359, 7040, 1777, 7935, 2546, 1161]
+Saving to output.wav...
+Done!

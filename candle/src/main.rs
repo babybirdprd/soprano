@@ -164,6 +164,8 @@ fn main() -> Result<()> {
             logits = Tensor::from_vec(logits_vec, logits.dims(), logits.device())?;
         }
 
+        pos += current_input.dim(1)?;
+
         // Sampling
         let next_token = if temperature > 0.0 {
             let prs = candle_nn::ops::softmax_last_dim(&(logits / (temperature as f64))?)?;
@@ -199,7 +201,6 @@ fn main() -> Result<()> {
         generated_hidden_states.push(last_hidden);
 
         current_input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
-        pos += current_input.dim(1)?;
     }
 
     // 5. Extract Audio Tokens / Hidden States
@@ -224,7 +225,7 @@ fn main() -> Result<()> {
     // 6. Decode
     println!("Decoding audio...");
     // Vocos forward expects (B, C, T)
-    let mut audio_vec = vocos.forward(&hidden_tensor)?;
+    let audio_vec = vocos.forward(&hidden_tensor)?;
 
     if audio_vec.is_empty() {
         anyhow::bail!("Decoded audio is empty.");

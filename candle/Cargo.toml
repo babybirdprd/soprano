@@ -16,3 +16,4 @@ clap = { version = "4.4", features = ["derive"] }
 hf-hub = "0.4"
 rand = "0.8"
 realfft = "3"
+rustfft = "6"
