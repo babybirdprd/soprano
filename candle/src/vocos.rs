@@ -16,7 +16,7 @@ pub struct VocosConfig {
     pub dw_kernel: usize,
 }
 
-pub struct ConvNeXtBlock {
+struct ConvNeXtBlock {
     dwconv: Conv1d,
     norm: LayerNorm,
     pwconv1: Linear,
@@ -104,11 +104,11 @@ impl Module for ConvNeXtBlock {
     }
 }
 
-pub struct VocosBackbone {
-    pub embed: Conv1d,
-    pub norm: LayerNorm,
-    pub convnext: Vec<ConvNeXtBlock>,
-    pub final_layer_norm: LayerNorm,
+struct VocosBackbone {
+    embed: Conv1d,
+    norm: LayerNorm,
+    convnext: Vec<ConvNeXtBlock>,
+    final_layer_norm: LayerNorm,
 }
 
 impl VocosBackbone {
@@ -179,7 +179,7 @@ impl Module for VocosBackbone {
     }
 }
 
-pub struct ISTFTHead {
+struct ISTFTHead {
     out: Linear,
     n_fft: usize,
     hop_length: usize,
@@ -232,9 +232,9 @@ fn hann_window(size: usize, device: &Device) -> Result<Tensor> {
 }
 
 pub struct SopranoDecoder {
-    pub decoder: VocosBackbone,
-    pub head: ISTFTHead,
-    pub upscale: usize,
+    decoder: VocosBackbone,
+    head: ISTFTHead,
+    upscale: usize,
 }
 
 impl SopranoDecoder {
@@ -273,10 +273,6 @@ impl SopranoDecoder {
         println!("DEBUG_RUST_BACKBONE shape: {:?}", x_decoded.dims());
         let x_decoded_flat = x_decoded.flatten_all()?.to_vec1::<f32>()?;
         println!(
-            "DEBUG_RUST_BACKBONE head: {:?}",
-            &x_decoded_flat[..10.min(x_decoded_flat.len())]
-        );
-        println!(
             "DEBUG_RUST_BACKBONE tail: {:?}",
             &x_decoded_flat[x_decoded_flat.len().saturating_sub(10)..]
         );
@@ -294,20 +290,12 @@ impl SopranoDecoder {
         println!("DEBUG_RUST_MAG shape: {:?}", mag.dims());
         let mag_flat = mag.flatten_all()?.to_vec1::<f32>()?;
         println!(
-            "DEBUG_RUST_MAG head: {:?}",
-            &mag_flat[..10.min(mag_flat.len())]
-        );
-        println!(
             "DEBUG_RUST_MAG tail: {:?}",
             &mag_flat[mag_flat.len().saturating_sub(10)..]
         );
 
         println!("DEBUG_RUST_PHASE shape: {:?}", p.dims());
         let p_flat = p.flatten_all()?.to_vec1::<f32>()?;
-        println!(
-            "DEBUG_RUST_PHASE head: {:?}",
-            &p_flat[..10.min(p_flat.len())]
-        );
         println!(
             "DEBUG_RUST_PHASE tail: {:?}",
             &p_flat[p_flat.len().saturating_sub(10)..]
@@ -344,10 +332,10 @@ impl SopranoDecoder {
                 spectrum.push(Complex::new(re_vec[idx], im_vec[idx]));
             }
 
-            // Zero out DC and Nyquist bins to satisfy Python's spectral_ops bug fix
-            spectrum[0] = Complex::new(0.0, 0.0);
+            // Zero out imaginary parts of DC and Nyquist bins to satisfy realfft
+            spectrum[0].im = 0.0;
             if num_freqs > 0 {
-                spectrum[num_freqs - 1] = Complex::new(0.0, 0.0);
+                spectrum[num_freqs - 1].im = 0.0;
             }
 
             // Perform IRFFT - output is real-valued time signal
@@ -365,17 +353,8 @@ impl SopranoDecoder {
 
             if t == 0 {
                 println!(
-                    "DEBUG_RUST_IRFFT_FRAME0_SCALED head: {:?}",
-                    &output
-                        .iter()
-                        .map(|&s| s * scale)
-                        .take(10)
-                        .collect::<Vec<f32>>()
-                );
-                println!(
                     "DEBUG_RUST_IRFFT_FRAME0_SCALED tail: {:?}",
-                    &output.iter().map(|&s| s * scale).collect::<Vec<f32>>()
-                        [output.len().saturating_sub(10)..]
+                    &output.iter().map(|&s| s * scale).collect::<Vec<f32>>()[..10]
                 );
             }
         }
@@ -436,10 +415,6 @@ impl SopranoDecoder {
 
         let audio_len = result.len();
         println!("DEBUG_RUST_FINAL_AUDIO shape: [{}]", audio_len);
-        println!(
-            "DEBUG_RUST_FINAL_AUDIO head: {:?}",
-            &result[..10.min(audio_len)]
-        );
         println!(
             "DEBUG_RUST_FINAL_AUDIO tail: {:?}",
             &result[audio_len.saturating_sub(10)..]
