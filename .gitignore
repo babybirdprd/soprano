@@ -1,5 +1,6 @@
+target/
 __pycache__/
-test.py
 *.wav
+*.safetensors
 dist/
 *.egg-info/
