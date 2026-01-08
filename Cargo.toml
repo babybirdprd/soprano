@@ -38,8 +38,13 @@ lazy_static = "1.5"
 clap = { version = "4.4", features = ["derive"] }
 
 # Server (for soprano-server)
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
 tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 futures = "0.3"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

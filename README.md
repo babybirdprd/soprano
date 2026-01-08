@@ -48,6 +48,47 @@ cargo run --release -- --prompt "Your text here." --cpu
 | `--output` | Output WAV file path | `output.wav` |
 | `--cpu` | Force CPU inference | `false` |
 
+### HTTP Server
+
+Run the TTS server for API access:
+
+```bash
+# Start server on default port 3000
+cargo run --release -p soprano-server
+
+# Custom host and port
+cargo run --release -p soprano-server -- --host 0.0.0.0 --port 8080
+```
+
+#### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/audio/speech` | POST | OpenAI-compatible TTS |
+| `/v1/audio/speech/stream` | POST | SSE streaming audio |
+| `/v1/text-to-speech/{voice_id}` | POST | ElevenLabs-compatible TTS |
+| `/ws` | GET | WebSocket for real-time TTS |
+| `/health` | GET | Health check |
+
+#### OpenAI-Compatible Example
+
+```bash
+curl -X POST http://localhost:3000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model":"soprano-80m","input":"Hello world!"}' \
+  --output speech.wav
+```
+
+#### WebSocket Protocol
+
+Connect to `ws://localhost:3000/ws` and send JSON messages:
+
+```json
+{"text": "Hello world!", "stream": true, "chunk_size": 5}
+```
+
+Server responds with base64-encoded PCM audio chunks.
+
 ## Model Details
 
 This port uses the **Soprano-80M** model. Weights are automatically downloaded from Hugging Face on first run.
@@ -92,12 +133,12 @@ This port uses the **Soprano-80M** model. Weights are automatically downloaded f
 - [x] `--chunk-size` configurable chunks
 - [x] ~1.4-1.8x realtime performance on CPU
 
-### � Phase 5: Server & API (In Progress)
+### ✅ Phase 5: Server & API (Complete)
 - [x] HTTP server skeleton with Axum
-- [ ] OpenAI TTS API compatibility (`/v1/audio/speech`)
-- [ ] ElevenLabs API compatibility
-- [ ] Server-Sent Events (SSE) for streaming
-- [ ] WebSocket support
+- [x] OpenAI TTS API compatibility (`/v1/audio/speech`)
+- [x] ElevenLabs API compatibility (`/v1/text-to-speech/{voice_id}`)
+- [x] Server-Sent Events (SSE) for streaming
+- [x] WebSocket support
 
 ### ⚡ Phase 6: Advanced Features
 - [ ] Batched inference for throughput
