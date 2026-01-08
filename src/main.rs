@@ -1,17 +1,20 @@
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-// use candle_transformers::models::qwen2::{Config as QwenConfig, ModelForCausalLM as QwenModel};
 use clap::Parser;
+use fancy_regex::Regex;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use hound;
+use std::time::Instant;
 use tokenizers::Tokenizer;
 
-mod vocos;
-use vocos::{SopranoDecoder, VocosConfig};
 mod qwen;
-use fancy_regex::Regex;
+mod text;
+mod vocos;
+
 use qwen::{Config as QwenConfig, ModelForCausalLM as QwenModel};
+use text::clean_text;
+use vocos::{SopranoDecoder, VocosConfig};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -28,20 +31,6 @@ struct Args {
 
     #[arg(long)]
     cpu: bool,
-}
-
-fn clean_text(text: &str) -> String {
-    // Matches Python's clean_text loosely for now, focus on allowed chars
-    let text = text.to_lowercase();
-    let mut cleaned = String::new();
-    for c in text.chars() {
-        if c.is_alphanumeric() || " !$%&'*+,-./0123456789? ".contains(c) {
-            cleaned.push(c);
-        }
-    }
-    // Dedup spaces
-    let re = Regex::new(r"\s+").unwrap();
-    re.replace_all(&cleaned, " ").to_string().trim().to_string()
 }
 
 fn preprocess_text(text: &str, min_length: usize) -> Vec<String> {
@@ -130,6 +119,7 @@ fn main() -> Result<()> {
     let vocos = SopranoDecoder::new(&vocos_config, vb_vocos)?;
 
     // 4. Inference - Qwen
+    let inference_start = Instant::now();
     let sentences = preprocess_text(&args.prompt, 30);
     println!("Number of sentences to process: {}", sentences.len());
 
@@ -257,6 +247,8 @@ fn main() -> Result<()> {
         anyhow::bail!("No audio generated.");
     }
 
+    // Calculate performance metrics
+    let audio_duration_secs = all_audio.len() as f64 / 32000.0;
     let min_audio = all_audio.iter().fold(f32::INFINITY, |a, &b| a.min(b));
     let max_audio = all_audio.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     println!(
@@ -282,6 +274,14 @@ fn main() -> Result<()> {
     writer.finalize()?;
 
     println!("Done!");
+
+    // Print performance metrics
+    let inference_elapsed = inference_start.elapsed().as_secs_f64();
+    let rtf = audio_duration_secs / inference_elapsed;
+    println!("\n=== Performance ===");
+    println!("Audio duration: {:.2}s", audio_duration_secs);
+    println!("Generation time: {:.2}s", inference_elapsed);
+    println!("RTF: {:.1}x realtime", rtf);
 
     Ok(())
 }
