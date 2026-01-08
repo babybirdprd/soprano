@@ -1,22 +1,45 @@
-[package]
-name = "soprano-candle"
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/user/soprano-candle"
 
-[dependencies]
+[workspace.dependencies]
+# ML Framework
 candle-core = "0.8.4"
 candle-nn = "0.8.4"
 candle-transformers = "0.8.4"
+
+# Tokenization
 tokenizers = "0.22"
+
+# Utilities
 anyhow = "1.0"
-hound = "3.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-clap = { version = "4.4", features = ["derive"] }
 hf-hub = "0.4"
 rand = "0.8"
+
+# Audio
+hound = "3.5"
 realfft = "3"
 rustfft = "6"
-regex = "1.12.2"
-fancy-regex = "0.17.0"
+
+# Text processing
+regex = "1.12"
+fancy-regex = "0.17"
 lazy_static = "1.5"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# Server (for soprano-server)
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+futures = "0.3"

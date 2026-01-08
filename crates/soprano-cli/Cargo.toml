@@ -1,0 +1,17 @@
+[package]
+name = "soprano-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for Soprano TTS"
+
+[dependencies]
+soprano-core = { path = "../soprano-core" }
+candle-core.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+hound.workspace = true
+
+[[bin]]
+name = "soprano"
+path = "src/main.rs"
